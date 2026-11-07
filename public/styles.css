@@ -436,6 +436,27 @@ input[type="range"]::-moz-range-thumb {
 .chat-form .btn { padding: 10px 14px; }
 .chat-empty { color: var(--muted); font-size: 13px; }
 
+/* ---------------- Self marker (DOM, not canvas) ---------------- */
+
+.self-marker-wrap {
+  background: transparent;
+  border: none;
+  pointer-events: none;
+}
+.self-marker-ring {
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  border: 2px solid rgba(127, 231, 255, .45);
+}
+.self-marker-dot {
+  position: absolute;
+  inset: 9px;
+  border-radius: 50%;
+  background: #7fe7ff;
+  box-shadow: 0 0 0 3px #0b0f14, 0 0 14px rgba(127, 231, 255, .75);
+}
+
 /* ---------------- Ping markers ---------------- */
 
 .ping-icon-wrap { background: transparent; border: none; }

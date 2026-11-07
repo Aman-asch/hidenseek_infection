@@ -12,52 +12,250 @@
   const LS_SETTINGS = 'infection.settings';
   const LS_MAP_STYLE = 'infection.mapStyle';
 
-  const GEO_OPTS = {
-    enableHighAccuracy: true,
-    maximumAge: 0,
-    timeout: 15000,
-  };
+  const GEO_OPTS_HIGH = { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 };
+  const GEO_OPTS_LOW = { enableHighAccuracy: false, maximumAge: 5000, timeout: 20000 };
   const GPS_RETRY_MS = 10000;
-  const LOCATION_SEND_MS = 1000;
-  const MIN_SEND_DISTANCE_M = 5; // only send if moved at least this far
+
+  const GPS_MAX_ACCURACY_M = 50;
+  const GPS_MIN_ACCURACY_M = 1;
+  const GPS_GATE_CHI2 = 16;
+  const GPS_GATE_MIN_M = 35;
+  const GPS_STATIONARY_SPEED = 0.7;
+  const GPS_MAX_DT_S = 10;
+  const GPS_HEARTBEAT_MS = 8000;
+  const GPS_MIN_SEND_M = 4;
+  const GPS_WARMUP_FIXES = 2;
+  const GPS_MIN_SEND_GAP_MS = 800;
+
+  const M_PER_DEG_LAT = 111320;
 
   /* ================================================================ */
-  /* Kalman filter (1D, adapted from the widely-used GPSKalmanFilter)  */
+  /* GPS engine — 2D constant-velocity Kalman filter in local metres   */
   /* ================================================================ */
 
-  class GPSKalmanFilter {
-    constructor(decay = 3) {
-      this.decay = decay;
-      this.variance = -1;
-      this.minAccuracy = 1;
+  class GpsKalman2D {
+    constructor() { this.reset(); }
+
+    reset() {
+      this.initialized = false;
+      this.refLat = 0;
+      this.refLng = 0;
+      this.mPerDegLng = M_PER_DEG_LAT;
+      this.x = 0; this.y = 0; this.vx = 0; this.vy = 0;
+      this.P = new Float64Array(16);
+      this.lastTs = 0;
+      this.rawAccEma = null;
+      this.accepted = 0;
+      this.rejected = 0;
     }
 
-    process(lat, lng, accuracy, timestampInMs) {
-      if (accuracy < this.minAccuracy) accuracy = this.minAccuracy;
+    _project(lat, lng) {
+      return {
+        x: (lng - this.refLng) * this.mPerDegLng,
+        y: (lat - this.refLat) * M_PER_DEG_LAT,
+      };
+    }
 
-      if (this.variance < 0) {
-        this.timestampInMs = timestampInMs;
-        this.lat = lat;
-        this.lng = lng;
-        this.variance = accuracy * accuracy;
-      } else {
-        const timeIncMs = timestampInMs - this.timestampInMs;
-        if (timeIncMs > 0) {
-          this.variance += (timeIncMs * this.decay * this.decay) / 1000;
-          this.timestampInMs = timestampInMs;
+    _unproject(x, y) {
+      return {
+        lat: this.refLat + y / M_PER_DEG_LAT,
+        lng: this.refLng + x / this.mPerDegLng,
+      };
+    }
+
+    _symmetrize() {
+      const P = this.P;
+      for (let r = 0; r < 4; r++) {
+        for (let c = r + 1; c < 4; c++) {
+          const v = (P[r * 4 + c] + P[c * 4 + r]) / 2;
+          P[r * 4 + c] = v;
+          P[c * 4 + r] = v;
         }
+      }
+    }
 
-        const k = this.variance / (this.variance + accuracy * accuracy);
-        this.lat += k * (lat - this.lat);
-        this.lng += k * (lng - this.lng);
-        this.variance = (1 - k) * this.variance;
+    _predict(dt, speed) {
+      const P = this.P;
+
+      const sigmaA = Math.min(4.0, 0.4 + 0.9 * speed);
+      const q = sigmaA * sigmaA;
+
+      this.x += this.vx * dt;
+      this.y += this.vy * dt;
+
+      const fp = new Float64Array(16);
+      for (let r = 0; r < 4; r++) {
+        for (let c = 0; c < 4; c++) {
+          let s;
+          if (r === 0) s = P[0 * 4 + c] + dt * P[2 * 4 + c];
+          else if (r === 1) s = P[1 * 4 + c] + dt * P[3 * 4 + c];
+          else if (r === 2) s = P[2 * 4 + c];
+          else s = P[3 * 4 + c];
+          fp[r * 4 + c] = s;
+        }
+      }
+      for (let r = 0; r < 4; r++) {
+        for (let c = 0; c < 4; c++) {
+          let s;
+          if (c === 0) s = fp[r * 4 + 0] + dt * fp[r * 4 + 2];
+          else if (c === 1) s = fp[r * 4 + 1] + dt * fp[r * 4 + 3];
+          else if (c === 2) s = fp[r * 4 + 2];
+          else s = fp[r * 4 + 3];
+          P[r * 4 + c] = s;
+        }
       }
 
-      return { lat: this.lat, lng: this.lng, accuracy: Math.sqrt(this.variance) };
+      const dt2 = dt * dt;
+      const dt3 = dt2 * dt;
+      P[0] += q * dt3 / 3;
+      P[5] += q * dt3 / 3;
+      P[2] += q * dt2 / 2;
+      P[8] += q * dt2 / 2;
+      P[7] += q * dt2 / 2;
+      P[13] += q * dt2 / 2;
+      P[10] += q * dt;
+      P[15] += q * dt;
+
+      this._symmetrize();
+    }
+
+    _snapshot(accepted, reason) {
+      const { lat, lng } = this._unproject(this.x, this.y);
+      const posSigma = Math.sqrt(Math.max(1, this.P[0] + this.P[5]));
+      const accuracy = Math.max(posSigma, (this.rawAccEma || posSigma) * 0.6);
+      return {
+        accepted: !!accepted,
+        reason: reason || null,
+        lat,
+        lng,
+        accuracy,
+        speed: Math.hypot(this.vx, this.vy),
+        acceptedCount: this.accepted,
+        rejectedCount: this.rejected,
+      };
+    }
+
+    process(lat, lng, accuracy, timestampMs) {
+      const acc = Math.max(
+        GPS_MIN_ACCURACY_M,
+        Number.isFinite(accuracy) ? accuracy : GPS_MAX_ACCURACY_M
+      );
+
+      if (!this.initialized) {
+        if (acc > GPS_MAX_ACCURACY_M) {
+          this.rejected++;
+          return { accepted: false, reason: 'poor_accuracy', accuracy: acc };
+        }
+        this.refLat = lat;
+        this.refLng = lng;
+        this.mPerDegLng = M_PER_DEG_LAT * Math.max(0.1, Math.cos(lat * Math.PI / 180));
+        this.x = 0;
+        this.y = 0;
+        this.vx = 0;
+        this.vy = 0;
+        const p = acc * acc;
+        const v = 25;
+        this.P.fill(0);
+        this.P[0] = p;
+        this.P[5] = p;
+        this.P[10] = v;
+        this.P[15] = v;
+        this.lastTs = timestampMs;
+        this.rawAccEma = acc;
+        this.initialized = true;
+        this.accepted = 1;
+        return {
+          accepted: true,
+          lat, lng,
+          accuracy: acc,
+          speed: 0,
+          acceptedCount: 1,
+          rejectedCount: this.rejected,
+        };
+      }
+
+      const dtMs = timestampMs - this.lastTs;
+      if (dtMs <= 0) return this._snapshot(false, 'duplicate');
+
+      const dt = Math.min(GPS_MAX_DT_S, dtMs / 1000);
+      const speedBefore = Math.hypot(this.vx, this.vy);
+
+      this._predict(dt, speedBefore);
+      this.lastTs = timestampMs;
+
+      if (acc > GPS_MAX_ACCURACY_M) {
+        this.rejected++;
+        return { accepted: false, reason: 'poor_accuracy', accuracy: acc, speed: speedBefore };
+      }
+
+      const m = this._project(lat, lng);
+      const R = acc * acc;
+      const ix = m.x - this.x;
+      const iy = m.y - this.y;
+
+      const P = this.P;
+      const s00 = P[0] + R;
+      const s01 = P[1];
+      const s10 = P[4];
+      const s11 = P[5];
+      const det = s00 * s11 - s01 * s10;
+      if (Math.abs(det) < 1e-9) return this._snapshot(false, 'singular');
+
+      const invDet = 1 / det;
+      const si00 = s11 * invDet;
+      const si01 = -s01 * invDet;
+      const si10 = -s10 * invDet;
+      const si11 = s00 * invDet;
+
+      const maha2 = ix * (si00 * ix + si01 * iy) + iy * (si10 * ix + si11 * iy);
+      const innovationDist = Math.hypot(ix, iy);
+      if (maha2 > GPS_GATE_CHI2 && innovationDist > GPS_GATE_MIN_M) {
+        this.rejected++;
+        return { accepted: false, reason: 'outlier', accuracy: acc, speed: speedBefore };
+      }
+
+      const k0x = P[0] * si00 + P[1] * si10;
+      const k0y = P[0] * si01 + P[1] * si11;
+      const k1x = P[4] * si00 + P[5] * si10;
+      const k1y = P[4] * si01 + P[5] * si11;
+      const k2x = P[8] * si00 + P[9] * si10;
+      const k2y = P[8] * si01 + P[9] * si11;
+      const k3x = P[12] * si00 + P[13] * si10;
+      const k3y = P[12] * si01 + P[13] * si11;
+
+      this.x += k0x * ix + k0y * iy;
+      this.y += k1x * ix + k1y * iy;
+      this.vx += k2x * ix + k2y * iy;
+      this.vy += k3x * ix + k3y * iy;
+
+      const newP = new Float64Array(16);
+      for (let c = 0; c < 4; c++) {
+        newP[0 * 4 + c] = P[0 * 4 + c] - (k0x * P[0 * 4 + c] + k0y * P[1 * 4 + c]);
+        newP[1 * 4 + c] = P[1 * 4 + c] - (k1x * P[0 * 4 + c] + k1y * P[1 * 4 + c]);
+        newP[2 * 4 + c] = P[2 * 4 + c] - (k2x * P[0 * 4 + c] + k2y * P[1 * 4 + c]);
+        newP[3 * 4 + c] = P[3 * 4 + c] - (k3x * P[0 * 4 + c] + k3y * P[1 * 4 + c]);
+      }
+      this.P = newP;
+      this._symmetrize();
+
+      this.rawAccEma = this.rawAccEma == null
+        ? acc
+        : this.rawAccEma + 0.15 * (acc - this.rawAccEma);
+      this.accepted++;
+
+      const newSpeed = Math.hypot(this.vx, this.vy);
+      if (newSpeed < GPS_STATIONARY_SPEED && innovationDist < 8) {
+        this.vx = 0;
+        this.vy = 0;
+      }
+
+      return this._snapshot(true);
     }
   }
 
-  let gpsFilter = null;
+  let gpsFilter = new GpsKalman2D();
+  let gpsHighAccuracy = true;
+  let gpsFailures = 0;
 
   /* ================================================================ */
   /* Small helpers                                                    */
@@ -146,6 +344,7 @@
     mapReady: false,
     mapStyle: 'satellite',
     baseLayer: null,
+    vectorRenderer: null,
     wakeLock: null,
     selfMarker: null,
     accuracyCircle: null,
@@ -234,7 +433,6 @@
     btnRecenter: $('btn-recenter'),
     btnZoomIn: $('btn-zoom-in'),
     btnZoomOut: $('btn-zoom-out'),
-    btnNorth: $('btn-north'),
     btnFit: $('btn-fit'),
     btnMapPlain: $('btn-map-plain'),
     btnMapSat: $('btn-map-sat'),
@@ -424,6 +622,11 @@
     S.fittedPlay = false;
     S.lastSentLat = null;
     S.lastSentLng = null;
+    S.lastLocationSentAt = 0;
+
+    gpsFilter.reset();
+    gpsHighAccuracy = true;
+    gpsFailures = 0;
 
     clearPingMarkers();
     setScreen('game');
@@ -630,9 +833,7 @@
     S.mapStyle = style;
     try {
       localStorage.setItem(LS_MAP_STYLE, style);
-    } catch (_) {
-      /* ignore */
-    }
+    } catch (_) { /* ignore */ }
     syncMapStyleButtons();
     if (!S.map) return;
     if (S.baseLayer) S.map.removeLayer(S.baseLayer);
@@ -657,77 +858,82 @@
       wheelPxPerZoomLevel: 70,
       minZoom: 3,
       maxZoom: 19,
-      rotate: true,
-      bearing: 0,
-      touchRotate: true,
-      shiftKeyRotate: true,
-      touchZoom: true,
-      scrollWheelZoom: true,
-      doubleClickZoom: true,
-      dragging: true,
     }).setView([20, 0], 2);
+
+    // One padded canvas renderer for every vector layer.
+    S.vectorRenderer = L.canvas({ padding: 0.5 });
 
     applyMapStyle(S.mapStyle);
 
-    S.map.on('dragstart zoomstart rotatestart', () => {
-      S.userPanned = true;
-    });
+    S.map.on('dragstart zoomstart', () => { S.userPanned = true; });
 
     window.addEventListener('resize', () => {
       if (S.map) S.map.invalidateSize();
     });
     window.addEventListener('orientationchange', () => {
-      setTimeout(() => {
-        if (S.map) S.map.invalidateSize();
-      }, 200);
+      setTimeout(() => { if (S.map) S.map.invalidateSize(); }, 200);
     });
   }
 
   try {
     const savedMap = localStorage.getItem(LS_MAP_STYLE);
     if (savedMap === 'map' || savedMap === 'satellite') S.mapStyle = savedMap;
-  } catch (_) {
-    /* ignore */
-  }
+  } catch (_) { /* ignore */ }
   syncMapStyleButtons();
   el.btnMapPlain.addEventListener('click', () => applyMapStyle('map'));
   el.btnMapSat.addEventListener('click', () => applyMapStyle('satellite'));
 
+  /* --- Self marker (DOM, not canvas) --- */
+
+  function ensureSelfMarker(lat, lng) {
+    if (!S.map || S.selfMarker) return;
+    const icon = L.divIcon({
+      className: 'self-marker-wrap',
+      html: '<div class="self-marker-ring"></div><div class="self-marker-dot"></div>',
+      iconSize: [30, 30],
+      iconAnchor: [15, 15],
+    });
+    S.selfMarker = L.marker([lat, lng], {
+      icon,
+      interactive: false,
+      keyboard: false,
+      zIndexOffset: 1000,
+    }).addTo(S.map);
+  }
+
   function updateSelfMarker(lat, lng, accuracy) {
     if (!S.map) return;
-    if (!S.selfMarker) {
-      S.selfMarker = L.circleMarker([lat, lng], {
-        radius: 7,
-        color: '#7fe7ff',
-        weight: 3,
-        fillColor: '#0b0f14',
-        fillOpacity: 1,
-      }).addTo(S.map);
-    } else {
-      S.selfMarker.setLatLng([lat, lng]);
-    }
+    ensureSelfMarker(lat, lng);
+    S.selfMarker.setLatLng([lat, lng]);
 
-    if (Number.isFinite(accuracy) && accuracy > 0) {
+    if (Number.isFinite(accuracy) && accuracy > 12) {
       if (!S.accuracyCircle) {
         S.accuracyCircle = L.circle([lat, lng], {
           radius: accuracy,
+          renderer: S.vectorRenderer,
           color: '#7fe7ff',
           weight: 1,
           fillColor: '#7fe7ff',
           fillOpacity: 0.08,
+          interactive: false,
         }).addTo(S.map);
       } else {
         S.accuracyCircle.setLatLng([lat, lng]);
         S.accuracyCircle.setRadius(accuracy);
       }
+    } else if (S.accuracyCircle) {
+      S.map.removeLayer(S.accuracyCircle);
+      S.accuracyCircle = null;
     }
 
     if (!S.centeredOnce) {
       S.centeredOnce = true;
-      if (!S.center) S.map.setView([lat, lng], 15);
+      if (!S.center) S.map.setView([lat, lng], 16);
     }
     updateBoundaryWarning();
   }
+
+  /* --- Play circle --- */
 
   function drawPlayCircle() {
     if (!S.map) return;
@@ -742,6 +948,7 @@
     if (!S.playCircle) {
       S.playCircle = L.circle([S.center.lat, S.center.lng], {
         radius: S.radiusM,
+        renderer: S.vectorRenderer,
         color: '#7fe7ff',
         weight: 2,
         dashArray: '6 8',
@@ -777,6 +984,8 @@
       haversine(S.myPos.lat, S.myPos.lng, S.center.lat, S.center.lng) > S.radiusM;
     el.boundaryBanner.hidden = !outside;
   }
+
+  /* --- Ping rendering --- */
 
   function popupHtml(ping) {
     const dist = S.myPos
@@ -854,10 +1063,15 @@
         continue;
       }
 
-      const marker = L.marker([ping.lat, ping.lng], { icon: pingIcon(ping), keyboard: false }).addTo(S.map);
+      const marker = L.marker([ping.lat, ping.lng], {
+        icon: pingIcon(ping),
+        keyboard: false,
+      }).addTo(S.map);
       marker.bindPopup(() => popupHtml(ping));
       const accCircle =
-        Number.isFinite(ping.accuracy) && ping.accuracy > 0 ? accuracyCircleFor(ping) : null;
+        Number.isFinite(ping.accuracy) && ping.accuracy > 0
+          ? accuracyCircleFor(ping)
+          : null;
 
       S.pingMarkers.set(ping.id, {
         marker,
@@ -897,6 +1111,7 @@
     const color = ping.role === 'zombie' ? '#ff4d5e' : '#3ddc84';
     return L.circle([ping.lat, ping.lng], {
       radius: ping.accuracy,
+      renderer: S.vectorRenderer,
       color,
       weight: 1,
       dashArray: '4 4',
@@ -924,13 +1139,10 @@
   });
   el.btnZoomIn.addEventListener('click', () => S.map && S.map.zoomIn());
   el.btnZoomOut.addEventListener('click', () => S.map && S.map.zoomOut());
-  el.btnNorth.addEventListener('click', () => {
-    if (S.map && typeof S.map.setBearing === 'function') S.map.setBearing(0);
-  });
   el.btnFit.addEventListener('click', () => fitPlayArea(true));
 
   /* ================================================================ */
-  /* GPS (Kalman-filtered)                                            */
+  /* GPS runtime                                                      */
   /* ================================================================ */
 
   function startGps() {
@@ -940,12 +1152,142 @@
       return;
     }
 
-    gpsFilter = new GPSKalmanFilter(3); // Q = 3 m/s — tuned for walking
-    S.lastSentLat = null;
-    S.lastSentLng = null;
+    const opts = gpsHighAccuracy ? GEO_OPTS_HIGH : GEO_OPTS_LOW;
+    navigator.geolocation.getCurrentPosition(() => {}, () => {}, opts);
+    S.watchId = navigator.geolocation.watchPosition(onPosition, onGpsError, opts);
+  }
 
-    navigator.geolocation.getCurrentPosition(() => {}, () => {}, GEO_OPTS);
-    S.watchId = navigator.geolocation.watchPosition(onPosition, onGpsError, GEO_OPTS);
+  function stopGps() {
+    if (S.watchId !== null) {
+      navigator.geolocation.clearWatch(S.watchId);
+      S.watchId = null;
+    }
+    if (S.gpsRetryTimer) {
+      clearTimeout(S.gpsRetryTimer);
+      S.gpsRetryTimer = null;
+    }
+  }
+
+  function onPosition(pos) {
+    const rawLat = pos.coords.latitude;
+    const rawLng = pos.coords.longitude;
+    const rawAcc = pos.coords.accuracy;
+    const ts = Number.isFinite(pos.timestamp) ? pos.timestamp : Date.now();
+
+    const result = gpsFilter.process(rawLat, rawLng, rawAcc, ts);
+
+    if (!result.accepted) {
+      if (result.reason === 'poor_accuracy') {
+        S.gpsOk = false;
+        showGpsBanner(
+          `GPS accuracy is \u00b1${Math.round(result.accuracy)}m — move to open sky.`
+        );
+        updateGpsIndicator(result.accuracy, false);
+      }
+      return;
+    }
+
+    gpsFailures = 0;
+    S.gpsOk = true;
+    hideGpsBanner();
+    S.myPos = {
+      lat: result.lat,
+      lng: result.lng,
+      accuracy: result.accuracy,
+      speed: result.speed,
+    };
+
+    updateSelfMarker(result.lat, result.lng, result.accuracy);
+    updateGpsIndicator(result.accuracy, true);
+
+    if (result.acceptedCount < GPS_WARMUP_FIXES) return;
+
+    const now = performance.now();
+    let shouldSend = false;
+
+    if (S.lastSentLat == null || S.lastSentLng == null) {
+      shouldSend = true;
+    } else if (
+      haversine(S.lastSentLat, S.lastSentLng, result.lat, result.lng) >= GPS_MIN_SEND_M
+    ) {
+      shouldSend = true;
+    }
+
+    if (now - S.lastLocationSentAt >= GPS_HEARTBEAT_MS) shouldSend = true;
+    if (now - S.lastLocationSentAt < GPS_MIN_SEND_GAP_MS) shouldSend = false;
+
+    if (!shouldSend) return;
+
+    S.lastLocationSentAt = now;
+    S.lastSentLat = result.lat;
+    S.lastSentLng = result.lng;
+    socket.emit('location_update', {
+      lat: result.lat,
+      lng: result.lng,
+      accuracy: result.accuracy,
+      speed: result.speed,
+    });
+  }
+
+  function updateGpsIndicator(accuracy, ok) {
+    if (!el.hudGps) return;
+    if (!Number.isFinite(accuracy)) {
+      el.hudGps.textContent = 'GPS ?';
+      el.hudGps.className = 'hud-gps';
+      return;
+    }
+    const a = Math.round(accuracy);
+    el.hudGps.textContent = `GPS \u00b1${a}m${ok ? '' : ' (poor)'}`;
+    el.hudGps.className = 'hud-gps ' + (a > 60 ? 'poor' : a > 25 ? 'fair' : 'good');
+  }
+
+  function onGpsError(err) {
+    S.gpsOk = false;
+
+    let message =
+      'Location unavailable. Check that GPS is enabled and you have a clear view of the sky.';
+    if (err && err.code === 1) {
+      message =
+        'Location permission denied. Allow location access for this site in your browser settings.';
+    }
+
+    const isIosStandalone =
+      window.navigator.standalone === true ||
+      (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+
+    if (isIosStandalone && err && err.code === 1) {
+      message =
+        'If location is not working, please open this site in Safari instead of the home screen app, and allow location access.';
+    }
+
+    showGpsBanner(message);
+
+    if (err && (err.code === 2 || err.code === 3)) {
+      gpsFailures++;
+      if (gpsFailures >= 2 && gpsHighAccuracy) {
+        gpsHighAccuracy = false;
+        toast('Switching to standard GPS mode.', null);
+      }
+    }
+
+    if (S.watchId !== null) {
+      navigator.geolocation.clearWatch(S.watchId);
+      S.watchId = null;
+    }
+    if (S.gpsRetryTimer) clearTimeout(S.gpsRetryTimer);
+    S.gpsRetryTimer = setTimeout(() => {
+      S.gpsRetryTimer = null;
+      startGps();
+    }, GPS_RETRY_MS);
+  }
+
+  function showGpsBanner(message) {
+    el.gpsBanner.textContent = message;
+    el.gpsBanner.hidden = false;
+  }
+
+  function hideGpsBanner() {
+    el.gpsBanner.hidden = true;
   }
 
   function acquireWakeLock() {
@@ -966,113 +1308,6 @@
     const lock = S.wakeLock;
     S.wakeLock = null;
     if (lock) lock.release().catch(() => {});
-  }
-
-  function stopGps() {
-    if (S.watchId !== null) {
-      navigator.geolocation.clearWatch(S.watchId);
-      S.watchId = null;
-    }
-    if (S.gpsRetryTimer) {
-      clearTimeout(S.gpsRetryTimer);
-      S.gpsRetryTimer = null;
-    }
-  }
-
-  function onPosition(pos) {
-    const rawLat = pos.coords.latitude;
-    const rawLng = pos.coords.longitude;
-    const rawAccuracy = pos.coords.accuracy;
-    const timestamp = pos.timestamp || Date.now();
-
-    if (!gpsFilter) {
-      gpsFilter = new GPSKalmanFilter(3);
-    }
-
-    const filtered = gpsFilter.process(rawLat, rawLng, rawAccuracy, timestamp);
-
-    S.myPos = {
-      lat: filtered.lat,
-      lng: filtered.lng,
-      accuracy: filtered.accuracy,
-    };
-    S.gpsOk = true;
-    hideGpsBanner();
-    updateSelfMarker(filtered.lat, filtered.lng, filtered.accuracy);
-    updateGpsIndicator(filtered.accuracy);
-
-    const now = performance.now();
-    let shouldSend = false;
-
-    if (!S.lastSentLat || !S.lastSentLng) {
-      shouldSend = true;
-    } else {
-      const moved = haversine(S.lastSentLat, S.lastSentLng, filtered.lat, filtered.lng);
-      if (moved >= MIN_SEND_DISTANCE_M) shouldSend = true;
-    }
-
-    if (shouldSend && now - S.lastLocationSentAt >= LOCATION_SEND_MS) {
-      S.lastLocationSentAt = now;
-      S.lastSentLat = filtered.lat;
-      S.lastSentLng = filtered.lng;
-      socket.emit('location_update', {
-        lat: filtered.lat,
-        lng: filtered.lng,
-        accuracy: filtered.accuracy,
-      });
-    }
-  }
-
-  function updateGpsIndicator(accuracy) {
-    if (!el.hudGps) return;
-    if (!Number.isFinite(accuracy)) {
-      el.hudGps.textContent = 'GPS ?';
-      el.hudGps.className = 'hud-gps';
-      return;
-    }
-    const a = Math.round(accuracy);
-    el.hudGps.textContent = `GPS \u00b1${a}m`;
-    el.hudGps.className =
-      'hud-gps ' + (a > 100 ? 'poor' : a > 30 ? 'fair' : 'good');
-  }
-
-  function onGpsError(err) {
-    S.gpsOk = false;
-
-    let message = 'Location unavailable. Check that GPS is enabled and you have a clear view of the sky.';
-    if (err && err.code === 1) {
-      message = 'Location permission denied. Allow location access for this site in your browser settings.';
-    }
-
-    const isIosStandalone =
-      window.navigator.standalone === true ||
-      (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
-
-    if (isIosStandalone && err && err.code === 1) {
-      message =
-        'If location is not working, please open this site in Safari instead of the home screen app, and allow location access.';
-    }
-
-    showGpsBanner(message);
-
-    if (S.watchId !== null) {
-      navigator.geolocation.clearWatch(S.watchId);
-      S.watchId = null;
-    }
-    if (S.gpsRetryTimer) clearTimeout(S.gpsRetryTimer);
-    S.gpsRetryTimer = setTimeout(() => {
-      S.gpsRetryTimer = null;
-      startGps();
-    }, GPS_RETRY_MS);
-  }
-
-  function showGpsBanner(message) {
-    el.gpsBanner.textContent = message;
-    el.gpsBanner.hidden = false;
-  }
-
-  function hideGpsBanner() {
-    el.gpsBanner.hidden = true;
   }
 
   document.addEventListener('visibilitychange', () => {
@@ -1118,9 +1353,7 @@
         savedSettings.boundary === 'none' ? 'none' : 'circle'
       );
     }
-  } catch (_) {
-    /* ignore */
-  }
+  } catch (_) { /* ignore */ }
 
   function syncHomeSettingsLabels() {
     const noLimit = el.noLimit.checked;
@@ -1410,17 +1643,13 @@
     deferredPrompt.prompt();
     try {
       await deferredPrompt.userChoice;
-    } catch (_) {
-      /* ignore */
-    }
+    } catch (_) { /* ignore */ }
     deferredPrompt = null;
   });
 
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-      navigator.serviceWorker.register('/sw.js').catch(() => {
-        /* SW is best-effort */
-      });
+      navigator.serviceWorker.register('/sw.js').catch(() => { /* best-effort */ });
     });
   }
 

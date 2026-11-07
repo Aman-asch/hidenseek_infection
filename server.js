@@ -5,7 +5,6 @@ const http = require('http');
 const express = require('express');
 const { Server } = require('socket.io');
 
-// Generate PWA icons on first boot if they are missing (no binary files in git).
 require('./tools/make-icons').ensureIcons();
 
 /* ------------------------------------------------------------------ */
@@ -14,10 +13,10 @@ require('./tools/make-icons').ensureIcons();
 
 const PORT = process.env.PORT || 3000;
 
-const GRACE_MS = 2 * 60 * 1000;          // reconnect grace period (spec: 2 min)
-const KEEPALIVE_MS = 4 * 60 * 1000;      // heartbeat every 4 min (Render idles at 15 min)
-const MAX_PLAYERS = 999;                 // 3-digit codes => 000..999
-const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I ambiguity
+const GRACE_MS = 2 * 60 * 1000;
+const KEEPALIVE_MS = 4 * 60 * 1000;
+const MAX_PLAYERS = 999;
+const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const ROOM_CODE_LENGTH = 4;
 
 const ROUND_MIN = 5;
@@ -28,8 +27,8 @@ const PING_MIN = 10;
 const PING_MAX = 120;
 const PING_DEFAULT = 30;
 
-const GATHER_MS = 5 * 1000;              // everyone shares one map and stands in a circle
-const PLAY_RADIUS_M = 1000;              // fixed circle, it does not shrink
+const GATHER_MS = 5 * 1000;
+const PLAY_RADIUS_M = 1000;
 const SEEKER_WAIT_MIN = 0;
 const SEEKER_WAIT_MAX = 180;
 const SEEKER_WAIT_DEFAULT = 30;
@@ -38,36 +37,26 @@ const CHAT_MAX = 200;
 const CHAT_HISTORY = 40;
 const CHAT_GAP_MS = 400;
 
-const TICK_MS = 500;                     // internal tick (cheap, no I/O)
+const TICK_MS = 500;
 const TIME_BROADCAST_MS = 1000;
 
-// Two-tier GPS filter. Movement keeps anything a phone can reasonably produce.
-// Pings prefer a tighter subset so Wi-Fi/IP geolocation (often 50–500 m off on
-// desktop Chrome) is not drawn as if it were a GPS point. If nothing meets the
-// ping bar, the broadcast is the best fix we have and is marked stale.
 const TRACK_MAX_ACCURACY_M = 50;
 const PING_MAX_ACCURACY_M = 25;
 const SMOOTH_WINDOW_MS = 10 * 1000;
 const STALE_MAX_AGE_MS = 60 * 1000;
 const FIX_BUFFER_MAX = 60;
 
-// A tag lands if the smoothed positions are within 15 m, or if the reported
-// uncertainty circles still overlap after each radius is capped. The cap stops
-// a ±150 m desktop fix from authorizing a tag from across campus.
 const TAG_DISTANCE_M = 15;
 const TAG_RADIUS_CAP_M = 30;
 const TAG_ABS_MAX_M = 40;
 
-// A fix that jumps farther than a person can move is kept in the raw buffer
-// but left out of the median. 80 m in a few seconds is a GPS spike, not a sprint.
 const TELEPORT_MIN_M = 80;
 const TELEPORT_MAX_MPS = 12;
 
 /* ------------------------------------------------------------------ */
-/* State (in-memory only, discarded when the room ends)                */
+/* State                                                               */
 /* ------------------------------------------------------------------ */
 
-/** @type {Map<string, Room>} */
 const rooms = new Map();
 
 /* ------------------------------------------------------------------ */
@@ -103,8 +92,6 @@ app.get('/health', (_req, res) => {
   });
 });
 
-// Tiny endpoint the client pings before opening the socket so Render can
-// start warming up while the "Connecting…" overlay is showing.
 app.get('/wake', (_req, res) => res.type('text/plain').send('awake'));
 
 const server = http.createServer(app);
@@ -130,11 +117,10 @@ function clampInt(value, min, max, fallback) {
 }
 
 function normNickname(raw) {
-  const s = String(raw == null ? '' : raw)
+  return String(raw == null ? '' : raw)
     .replace(/[\u0000-\u001f\u007f]/g, '')
     .trim()
     .slice(0, 20);
-  return s;
 }
 
 function normSessionId(raw) {
@@ -188,7 +174,6 @@ function makeRoomCode() {
     }
     if (!rooms.has(code)) return code;
   }
-  // Extremely unlikely; append a random suffix to break the loop.
   return ('R' + Date.now().toString(36).toUpperCase()).slice(0, ROOM_CODE_LENGTH + 2);
 }
 
@@ -238,7 +223,6 @@ function isTrackFix(fix) {
   return usableAccuracy(fix.accuracy) && fix.accuracy <= TRACK_MAX_ACCURACY_M && !fix.teleport;
 }
 
-/** True when this fix could not have been reached on foot from the last tracked one. */
 function looksLikeTeleport(player, fix) {
   const prev = player.lastTrackedFix;
   if (!prev) return false;
@@ -249,7 +233,6 @@ function looksLikeTeleport(player, fix) {
   return dist / dt > TELEPORT_MAX_MPS;
 }
 
-/** Drop fixes that have aged out of the smoothing window. */
 function pruneFixes(player, now) {
   const cutoff = now - SMOOTH_WINDOW_MS;
   if (player.fixes.length > FIX_BUFFER_MAX) {
@@ -278,10 +261,6 @@ function rememberGood(player, pos) {
   player.lastGood = pos;
 }
 
-/**
- * Median of the last 10s of fixes that are good enough to track (≤ 50 m).
- * Used for tag distance so one jumped point cannot make or break a tag.
- */
 function trackingPosition(player, now) {
   const window = pruneFixes(player, now);
   const track = window.filter(isTrackFix);
@@ -297,11 +276,6 @@ function trackingPosition(player, now) {
   return null;
 }
 
-/**
- * Position broadcast on a ping. Prefers a median of ≤ 25 m fixes. Falls back
- * to the track-quality median, then to the single tightest raw fix, then to
- * the last good position if it is less than a minute old. Fallbacks are stale.
- */
 function pingPosition(player, now) {
   const window = pruneFixes(player, now);
   const good = window.filter(isGoodFix);
@@ -338,12 +312,6 @@ function pingPosition(player, now) {
   return null;
 }
 
-/**
- * True when the players are within 15 m, or when their accuracy circles still
- * overlap after each radius is capped at 30 m — and the centres are within 40 m.
- * The 18 m "I'm standing next to them" case passes when both phones are ±10 m.
- * A ±150 m desktop fix cannot authorize a tag from across campus.
- */
 function tagProximityOk(distanceM, acc1, acc2) {
   if (!Number.isFinite(distanceM)) return false;
   if (distanceM <= TAG_DISTANCE_M) return true;
@@ -355,7 +323,7 @@ function tagProximityOk(distanceM, acc1, acc2) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Serialization (per-socket — 3-digit codes are NEVER leaked)         */
+/* Serialization                                                       */
 /* ------------------------------------------------------------------ */
 
 function serializeFor(room, sessionId) {
@@ -382,7 +350,7 @@ function serializeFor(room, sessionId) {
     host: room.hostSessionId === sessionId,
     hostSessionId: room.hostSessionId,
     settings: {
-      roundMinutes: room.settings.roundMinutes, // number | null (no limit)
+      roundMinutes: room.settings.roundMinutes,
       pingInterval: room.settings.pingInterval,
       seekerWait: room.settings.seekerWait,
       boundary: room.settings.boundary,
@@ -394,7 +362,7 @@ function serializeFor(room, sessionId) {
       ? {
           sessionId: me.sessionId,
           nickname: me.nickname,
-          code: me.code,          // only ever sent to its owner
+          code: me.code,
           isTagged: me.isTagged,
           connected: me.connected,
         }
@@ -424,11 +392,11 @@ function addPlayer(room, sessionId, nickname) {
     nickname,
     code,
     isTagged: false,
-    lastLocation: null,          // latest raw fix (unfiltered)
-    fixes: [],                   // raw ring buffer, last ~10 s
-    lastTrackedFix: null,        // last fix admitted into the median
-    lastGood: null,              // last median built from ≤ 50 m fixes
-    sticky: null,                // last position ever broadcast; markers do not vanish
+    lastLocation: null,
+    fixes: [],
+    lastTrackedFix: null,
+    lastGood: null,
+    sticky: null,
     lastChatAt: 0,
     connected: true,
     socketId: null,
@@ -605,7 +573,6 @@ function broadcastTimeRemaining(room) {
   }
 }
 
-/** Last smoothed fix, or the last one we already showed, so a marker never blinks out. */
 function displayPosition(player, now) {
   const pos = pingPosition(player, now);
   if (pos) {
@@ -632,18 +599,10 @@ function canSee(room, viewer, other) {
   const viewerIsZombie = viewer.isTagged;
   const otherIsZombie = other.isTagged;
   if (viewerIsZombie === otherIsZombie) return false;
-  // The seeker waits blind. Survivors can still see where the seeker is standing.
   if (room.stage === 'hiding' && viewerIsZombie && !otherIsZombie) return false;
   return true;
 }
 
-/**
- * Visibility:
- *   gather  -> everyone sees everyone, so the starting circle is shared
- *   hiding  -> survivors see the seeker; the seeker sees nobody
- *   hunt    -> opposite teams only
- * A player who has ever had a fix keeps that marker until they leave or change team.
- */
 function broadcastPings(room) {
   if (!rooms.has(room.code) || room.phase !== 'running') return;
   const all = [...room.players.values()];
@@ -659,9 +618,9 @@ function broadcastPings(room) {
     for (const other of all) {
       if (!canSee(room, viewer, other)) continue;
 
-      // During the initial gather, do not broadcast a player who has no
-      // real fix yet (or whose fix is very poor). This stops everyone
-      // from appearing on top of each other before GPS has locked on.
+      // During the opening gather, hide players who have no real fix yet,
+      // or whose fix is worse than a phone-GPS lock. Without this every
+      // player who hasn't locked on gets stacked on the same coordinate.
       if (room.stage === 'gather') {
         const fix = other.lastLocation;
         if (!fix || !Number.isFinite(fix.accuracy) || fix.accuracy > 50) continue;
@@ -733,8 +692,8 @@ function endGame(room, winner, reason) {
   clearGraceForAll(room);
 
   const payload = {
-    winner, // 'zombies' | 'survivors'
-    reason, // 'all_tagged' | 'time'
+    winner,
+    reason,
     players: [...room.players.values()].map((p) => ({
       sessionId: p.sessionId,
       nickname: p.nickname,
@@ -780,7 +739,6 @@ io.on('connection', (socket) => {
   socket.data.sessionId = null;
   socket.data.roomCode = null;
 
-  /* ---------------- create ---------------- */
   socket.on('create_room', (payload = {}, cb = () => {}) => {
     try {
       const sessionId = normSessionId(payload.sessionId);
@@ -789,9 +747,7 @@ io.on('connection', (socket) => {
       if (!nickname) return cb({ ok: false, error: 'Please enter a nickname.' });
 
       detachFromCurrentRoom(socket, null);
-
       const settings = readSettings(payload, null);
-
       const code = makeRoomCode();
       const room = {
         code,
@@ -836,7 +792,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  /* ---------------- join ---------------- */
   socket.on('join_room', (payload = {}, cb = () => {}) => {
     try {
       const sessionId = normSessionId(payload.sessionId);
@@ -851,9 +806,7 @@ io.on('connection', (socket) => {
       detachFromCurrentRoom(socket, room.code);
 
       let player = room.players.get(sessionId);
-
       if (player) {
-        // Same device rejoining its own slot.
         clearGrace(player);
         if (nickname) player.nickname = nickname;
       } else {
@@ -893,7 +846,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  /* ---------------- reconnect ---------------- */
   socket.on('reconnect_room', (payload = {}, cb = () => {}) => {
     try {
       const sessionId = normSessionId(payload.sessionId);
@@ -931,7 +883,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  /* ---------------- settings ---------------- */
   socket.on('update_settings', (payload = {}, cb = () => {}) => {
     const room = getRoom(socket.data.roomCode);
     if (!room) return cb({ ok: false, error: 'Room not found.' });
@@ -946,7 +897,6 @@ io.on('connection', (socket) => {
     cb({ ok: true, settings: room.settings });
   });
 
-  /* ---------------- start ---------------- */
   socket.on('start_game', (_payload = {}, cb = () => {}) => {
     const room = getRoom(socket.data.roomCode);
     if (!room) return cb({ ok: false, error: 'Room not found.' });
@@ -991,7 +941,6 @@ io.on('connection', (socket) => {
     cb({ ok: true });
   });
 
-  /* ---------------- location ---------------- */
   socket.on('location_update', (payload = {}) => {
     const room = getRoom(socket.data.roomCode);
     if (!room) return;
@@ -1015,9 +964,6 @@ io.on('connection', (socket) => {
     const prev = player.lastLocation;
     const movedM = prev ? haversineM(prev.lat, prev.lng, lat, lng) : null;
 
-    // Raw fix is always kept. Smoothing reads this buffer later; nothing here
-    // is rounded or offset. Fixes worse than 50 m stay in the buffer so a ping
-    // can fall back to them, but they are left out of the median.
     const fix = { lat, lng, accuracy: acc, ts: now, teleport: false };
     fix.teleport = looksLikeTeleport(player, fix);
     player.lastLocation = fix;
@@ -1044,7 +990,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  /* ---------------- tag ---------------- */
   socket.on('submit_tag', (payload = {}, cb = () => {}) => {
     const room = getRoom(socket.data.roomCode);
     if (!room) return cb({ ok: false, error: 'Room not found.' });
@@ -1094,7 +1039,6 @@ io.on('connection', (socket) => {
     checkWinCondition(room);
   });
 
-  /* ---------------- chat ---------------- */
   socket.on('chat', (payload = {}, cb = () => {}) => {
     const room = getRoom(socket.data.roomCode);
     if (!room || room.phase === 'ended') return cb({ ok: false, error: 'No game to chat in.' });
@@ -1134,7 +1078,6 @@ io.on('connection', (socket) => {
     socket.emit('room_left', { roomCode: code || null });
   });
 
-  /* ---------------- disconnect ---------------- */
   socket.on('disconnect', (reason) => {
     const code = socket.data.roomCode;
     if (!code) return;
@@ -1143,7 +1086,6 @@ io.on('connection', (socket) => {
 
     const player = room.players.get(socket.data.sessionId);
     if (!player) return;
-    // Ignore stale disconnects from a socket that has already been replaced.
     if (player.socketId !== socket.id) return;
 
     player.socketId = null;
@@ -1157,12 +1099,7 @@ io.on('connection', (socket) => {
 /* ------------------------------------------------------------------ */
 /* Render free-tier keep-alive                                         */
 /* ------------------------------------------------------------------ */
-/*
- * Render's free tier spins the service down after 15 minutes WITHOUT INBOUND
- * traffic. An idle open WebSocket does not count. So every 4 minutes we emit
- * a lightweight `heartbeat` to every socket; the client immediately replies
- * with `heartbeat_ack`, which IS inbound traffic and resets the idle timer.
- */
+
 setInterval(() => {
   const t = Date.now();
   io.emit('heartbeat', { t });
