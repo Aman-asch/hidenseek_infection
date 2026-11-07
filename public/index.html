@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no"
+/>
+<meta name="theme-color" content="#0b0f14" />
+<meta name="description" content="Real-time multiplayer GPS infection game." />
+
+<!-- iOS PWA -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Infection" />
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+
+<link rel="manifest" href="/manifest.json" />
+<link rel="icon" href="/icons/icon-192.png" />
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+
+<!-- ======================= CONNECT OVERLAY ======================= -->
+<div id="connect-overlay" class="overlay" role="alertdialog" aria-live="polite">
+  <div class="overlay-card">
+    <div class="spinner" aria-hidden="true"></div>
+    <h2 id="connect-title">Connecting to server…</h2>
+    <p id="connect-msg" class="muted">
+      This may take up to a minute on first launch while the free server wakes up.
+    </p>
+    <button id="btn-retry" class="btn btn-primary">Retry now</button>
+  </div>
+</div>
+
+<!-- ======================= HOME ======================= -->
+<section id="screen-home" class="screen" hidden>
+  <header class="brand">
+    <h1 class="logo">INFECTION</h1>
+    <p class="tagline">A real-time GPS tag game</p>
+  </header>
+
+  <div class="card">
+    <label class="label" for="nickname">Nickname</label>
+    <input
+      id="nickname"
+      class="input"
+      type="text"
+      maxlength="20"
+      placeholder="e.g. SwiftFox"
+      autocomplete="nickname"
+      autocapitalize="words"
+    />
+  </div>
+
+  <div class="card">
+    <button id="btn-show-create" class="btn btn-block">Create Game</button>
+    <div id="create-panel" class="panel" hidden>
+      <label class="label" for="round-range">
+        Round length <span id="round-val" class="value">15 min</span>
+      </label>
+      <input id="round-range" type="range" min="5" max="60" step="1" value="15" />
+      <label class="check">
+        <input id="no-limit" type="checkbox" />
+        <span>No limit</span>
+      </label>
+
+      <label class="label" for="ping-range">
+        Ping interval <span id="ping-val" class="value">30 s</span>
+      </label>
+      <input id="ping-range" type="range" min="10" max="120" step="5" value="30" />
+
+      <button id="btn-create" class="btn btn-primary btn-block">Create Room</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <button id="btn-show-join" class="btn btn-block">Join Game</button>
+    <div id="join-panel" class="panel" hidden>
+      <label class="label" for="room-input">Room code</label>
+      <input
+        id="room-input"
+        class="input input-code"
+        type="text"
+        maxlength="4"
+        placeholder="ABCD"
+        autocapitalize="characters"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <button id="btn-join" class="btn btn-primary btn-block">Join Room</button>
+    </div>
+  </div>
+
+  <p id="ios-install-hint" class="hint" hidden>
+    Install: tap <strong>Share</strong> → <strong>Add to Home Screen</strong>.
+  </p>
+  <p class="hint muted small">
+    Play with the app open and the screen on. Background GPS is not supported by mobile browsers.
+  </p>
+</section>
+
+<!-- ======================= LOBBY / ROOM ======================= -->
+<section id="screen-room" class="screen" hidden>
+  <header class="room-head">
+    <div>
+      <div class="label">Room code</div>
+      <div id="room-code" class="room-code">----</div>
+    </div>
+    <button id="btn-leave" class="btn btn-ghost">Leave</button>
+  </header>
+
+  <div class="card">
+    <div class="row">
+      <span class="label">Your code</span>
+      <span id="my-code" class="my-code">000</span>
+    </div>
+    <div class="row">
+      <span class="label">Status</span>
+      <span id="my-status" class="pill">Survivor</span>
+    </div>
+  </div>
+
+  <div id="host-controls" class="card" hidden>
+    <h2 class="h2">Host settings</h2>
+    <label class="label" for="host-round-range">
+      Round length <span id="host-round-val" class="value">15 min</span>
+    </label>
+    <input id="host-round-range" type="range" min="5" max="60" step="1" value="15" />
+    <label class="check">
+      <input id="host-no-limit" type="checkbox" />
+      <span>No limit</span>
+    </label>
+
+    <label class="label" for="host-ping-range">
+      Ping interval <span id="host-ping-val" class="value">30 s</span>
+    </label>
+    <input id="host-ping-range" type="range" min="10" max="120" step="5" value="30" />
+
+    <button id="btn-start" class="btn btn-primary btn-block">Start Game</button>
+  </div>
+
+  <div class="card">
+    <h2 class="h2">Players <span id="player-count" class="muted">0</span></h2>
+    <ul id="player-list" class="player-list"></ul>
+  </div>
+
+  <p class="hint muted small">
+    Show your 3-digit code only when a zombie is next to you — that is how they tag you.
+  </p>
+</section>
+
+<!-- ======================= IN-GAME ======================= -->
+<section id="screen-game" class="screen screen-game" hidden>
+  <div id="map"></div>
+
+  <div id="hud-top" class="hud-top">
+    <div id="timer" class="timer">--:--</div>
+    <div class="hud-top-right">
+      <div id="role-badge" class="role-badge">SURVIVOR</div>
+      <button id="btn-recenter" class="btn btn-round" title="Centre on me" aria-label="Centre on me">◎</button>
+    </div>
+  </div>
+
+  <div id="gps-banner" class="banner banner-warn" hidden>
+    Location unavailable. Check that GPS is enabled and you have a clear view of the sky.
+  </div>
+
+  <div id="hidden-banner" class="banner banner-error" hidden>
+    You left the app — GPS paused. Return to the app to keep playing.
+  </div>
+
+  <div id="hud-bottom" class="hud-bottom">
+    <div class="hud-left">
+      <div class="label tiny">Your code</div>
+      <div id="hud-code" class="hud-code">000</div>
+    </div>
+    <div class="hud-actions">
+      <button id="btn-players" class="btn">Players</button>
+      <button id="btn-tag" class="btn btn-danger" hidden>Tag Player</button>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= MODALS ======================= -->
+<div id="modal-tag" class="modal" hidden>
+  <div class="modal-card">
+    <h2>Tag a Survivor</h2>
+    <p class="muted">Type the 3-digit code shown on their phone.</p>
+    <input
+      id="tag-input"
+      class="input input-code"
+      type="text"
+      inputmode="numeric"
+      pattern="[0-9]*"
+      maxlength="3"
+      autocomplete="off"
+      placeholder="000"
+    />
+    <div id="tag-error" class="error" hidden></div>
+    <div class="modal-actions">
+      <button id="btn-tag-cancel" class="btn btn-ghost">Cancel</button>
+      <button id="btn-tag-submit" class="btn btn-danger">Tag</button>
+    </div>
+  </div>
+</div>
+
+<div id="modal-players" class="modal" hidden>
+  <div class="modal-card">
+    <h2>Players</h2>
+    <ul id="modal-player-list" class="player-list"></ul>
+    <div class="modal-actions">
+      <button id="btn-players-close" class="btn btn-ghost">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="modal-over" class="modal" hidden>
+  <div class="modal-card">
+    <h2 id="over-title">Game Over</h2>
+    <p id="over-sub" class="muted"></p>
+    <ul id="over-list" class="player-list"></ul>
+    <div class="modal-actions">
+      <button id="btn-over-close" class="btn btn-primary">Back to Lobby</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/socket.io/socket.io.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

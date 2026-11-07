@@ -1,0 +1,17 @@
+{
+  "name": "infection-gps-game",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Real-time multiplayer GPS infection game (PWA) — Socket.IO + Leaflet",
+  "main": "server.js",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js",
+    "build": "node tools/make-icons.js",
+    "icons": "node tools/make-icons.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
