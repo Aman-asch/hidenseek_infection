@@ -13,12 +13,51 @@
   const LS_MAP_STYLE = 'infection.mapStyle';
 
   const GEO_OPTS = {
-    enableHighAccuracy: true, // use the GPS radio, not Wi-Fi/cell
-    maximumAge: 0,            // force a fresh fix
+    enableHighAccuracy: true,
+    maximumAge: 0,
     timeout: 15000,
   };
   const GPS_RETRY_MS = 10000;
-  const LOCATION_SEND_MS = 1000; // client-side throttle: max 1 update/sec
+  const LOCATION_SEND_MS = 1000;
+  const MIN_SEND_DISTANCE_M = 5; // only send if moved at least this far
+
+  /* ================================================================ */
+  /* Kalman filter (1D, adapted from the widely-used GPSKalmanFilter)  */
+  /* ================================================================ */
+
+  class GPSKalmanFilter {
+    constructor(decay = 3) {
+      this.decay = decay;
+      this.variance = -1;
+      this.minAccuracy = 1;
+    }
+
+    process(lat, lng, accuracy, timestampInMs) {
+      if (accuracy < this.minAccuracy) accuracy = this.minAccuracy;
+
+      if (this.variance < 0) {
+        this.timestampInMs = timestampInMs;
+        this.lat = lat;
+        this.lng = lng;
+        this.variance = accuracy * accuracy;
+      } else {
+        const timeIncMs = timestampInMs - this.timestampInMs;
+        if (timeIncMs > 0) {
+          this.variance += (timeIncMs * this.decay * this.decay) / 1000;
+          this.timestampInMs = timestampInMs;
+        }
+
+        const k = this.variance / (this.variance + accuracy * accuracy);
+        this.lat += k * (lat - this.lat);
+        this.lng += k * (lng - this.lng);
+        this.variance = (1 - k) * this.variance;
+      }
+
+      return { lat: this.lat, lng: this.lng, accuracy: Math.sqrt(this.variance) };
+    }
+  }
+
+  let gpsFilter = null;
 
   /* ================================================================ */
   /* Small helpers                                                    */
@@ -71,8 +110,7 @@
     const secs = Math.max(0, Math.round((Date.now() - ts) / 1000));
     if (secs < 5) return 'just now';
     if (secs < 60) return secs + 's ago';
-    const mins = Math.round(secs / 60);
-    return mins + 'm ago';
+    return Math.round(secs / 60) + 'm ago';
   }
 
   /* ================================================================ */
@@ -112,7 +150,7 @@
     selfMarker: null,
     accuracyCircle: null,
     playCircle: null,
-    pingMarkers: new Map(), // id -> { marker, lat, lng, ts, nickname, role }
+    pingMarkers: new Map(),
     centeredOnce: false,
     userPanned: false,
     fittedPlay: false,
@@ -121,6 +159,8 @@
     watchId: null,
     gpsRetryTimer: null,
     lastLocationSentAt: 0,
+    lastSentLat: null,
+    lastSentLng: null,
     gpsOk: false,
 
     pingRafPending: false,
@@ -255,7 +295,6 @@
     if (name === 'game') {
       ensureMap();
       acquireWakeLock();
-      // Leaflet needs a tick after the container becomes visible.
       requestAnimationFrame(() => {
         if (S.map) S.map.invalidateSize();
       });
@@ -335,7 +374,6 @@
     socket.connect();
   });
 
-  /* --- Render keep-alive: reply to heartbeats so the service stays up --- */
   socket.on('heartbeat', () => {
     socket.emit('heartbeat_ack', { t: Date.now() });
   });
@@ -384,6 +422,8 @@
     S.centeredOnce = false;
     S.userPanned = false;
     S.fittedPlay = false;
+    S.lastSentLat = null;
+    S.lastSentLng = null;
 
     clearPingMarkers();
     setScreen('game');
@@ -400,7 +440,6 @@
 
   socket.on('ping_batch', (data) => {
     const pings = data.pings || [];
-    console.log(`[ping] received ${pings.length} ping(s) from server`);
     S.pendingPings = pings;
     if (!S.pingRafPending) {
       S.pingRafPending = true;
@@ -464,7 +503,6 @@
     el.myStatus.textContent = S.isTagged ? 'Seeker' : 'Survivor';
     el.myStatus.classList.toggle('zombie', !!S.isTagged);
 
-    // Host controls
     el.hostControls.hidden = !(S.isHost && S.phase === 'lobby');
     if (S.isHost) {
       const round = S.settings.roundMinutes;
@@ -482,7 +520,6 @@
       el.hostBoundaryCircle.classList.toggle('is-on', boundary === 'circle');
     }
 
-    // Player list (names only — codes are never broadcast)
     el.playerCount.textContent = String(S.players.length);
     el.playerList.innerHTML = '';
     for (const p of S.players) {
@@ -635,6 +672,15 @@
     S.map.on('dragstart zoomstart rotatestart', () => {
       S.userPanned = true;
     });
+
+    window.addEventListener('resize', () => {
+      if (S.map) S.map.invalidateSize();
+    });
+    window.addEventListener('orientationchange', () => {
+      setTimeout(() => {
+        if (S.map) S.map.invalidateSize();
+      }, 200);
+    });
   }
 
   try {
@@ -765,25 +811,9 @@
     );
   }
 
-  /**
-   * Pings are dropped in as brand-new markers (never slid to the new position —
-   * that would imply continuous tracking).
-   */
   function applyPings(pings) {
     if (!S.map) return;
     const seen = new Set();
-
-    if (pings.length > 0) {
-      console.log(
-        `[ping] applying ${pings.length}: ` +
-          pings
-            .map(
-              (p) =>
-                `${p.nickname}[${p.role}]±${p.accuracy ? Math.round(p.accuracy) + 'm' : '?'}${p.stale ? ' stale' : ''}`
-            )
-            .join(', ')
-      );
-    }
 
     for (const ping of pings) {
       seen.add(ping.id);
@@ -841,7 +871,6 @@
       });
     }
 
-    // Drop a marker only when this player is no longer visible (tagged onto your team, or left).
     for (const [id, entry] of S.pingMarkers) {
       if (!seen.has(id)) {
         S.map.removeLayer(entry.marker);
@@ -901,7 +930,7 @@
   el.btnFit.addEventListener('click', () => fitPlayArea(true));
 
   /* ================================================================ */
-  /* GPS                                                              */
+  /* GPS (Kalman-filtered)                                            */
   /* ================================================================ */
 
   function startGps() {
@@ -911,7 +940,10 @@
       return;
     }
 
-    // A one-shot high-accuracy request wakes the GPS radio on iOS before the watch starts.
+    gpsFilter = new GPSKalmanFilter(3); // Q = 3 m/s — tuned for walking
+    S.lastSentLat = null;
+    S.lastSentLng = null;
+
     navigator.geolocation.getCurrentPosition(() => {}, () => {}, GEO_OPTS);
     S.watchId = navigator.geolocation.watchPosition(onPosition, onGpsError, GEO_OPTS);
   }
@@ -948,26 +980,46 @@
   }
 
   function onPosition(pos) {
-    const lat = pos.coords.latitude;
-    const lng = pos.coords.longitude;
-    const accuracy = pos.coords.accuracy;
+    const rawLat = pos.coords.latitude;
+    const rawLng = pos.coords.longitude;
+    const rawAccuracy = pos.coords.accuracy;
+    const timestamp = pos.timestamp || Date.now();
 
-    S.myPos = { lat, lng, accuracy };
-    S.gpsOk = true;
-    hideGpsBanner();
-    updateSelfMarker(lat, lng, accuracy);
-    updateGpsIndicator(accuracy);
-
-    const accStr = Number.isFinite(accuracy) ? `${Math.round(accuracy)}m` : '?';
-    console.log(`[gps] lat=${lat.toFixed(6)} lng=${lng.toFixed(6)} acc=${accStr}`);
-    if (Number.isFinite(accuracy) && accuracy > 100) {
-      console.warn(`[gps] POOR ACCURACY ${accStr} \u2014 pings will be off by roughly this much`);
+    if (!gpsFilter) {
+      gpsFilter = new GPSKalmanFilter(3);
     }
 
+    const filtered = gpsFilter.process(rawLat, rawLng, rawAccuracy, timestamp);
+
+    S.myPos = {
+      lat: filtered.lat,
+      lng: filtered.lng,
+      accuracy: filtered.accuracy,
+    };
+    S.gpsOk = true;
+    hideGpsBanner();
+    updateSelfMarker(filtered.lat, filtered.lng, filtered.accuracy);
+    updateGpsIndicator(filtered.accuracy);
+
     const now = performance.now();
-    if (now - S.lastLocationSentAt >= LOCATION_SEND_MS) {
+    let shouldSend = false;
+
+    if (!S.lastSentLat || !S.lastSentLng) {
+      shouldSend = true;
+    } else {
+      const moved = haversine(S.lastSentLat, S.lastSentLng, filtered.lat, filtered.lng);
+      if (moved >= MIN_SEND_DISTANCE_M) shouldSend = true;
+    }
+
+    if (shouldSend && now - S.lastLocationSentAt >= LOCATION_SEND_MS) {
       S.lastLocationSentAt = now;
-      socket.emit('location_update', { lat, lng, accuracy });
+      S.lastSentLat = filtered.lat;
+      S.lastSentLng = filtered.lng;
+      socket.emit('location_update', {
+        lat: filtered.lat,
+        lng: filtered.lng,
+        accuracy: filtered.accuracy,
+      });
     }
   }
 
@@ -1003,7 +1055,6 @@
 
     showGpsBanner(message);
 
-    // Retry every 10 seconds.
     if (S.watchId !== null) {
       navigator.geolocation.clearWatch(S.watchId);
       S.watchId = null;
@@ -1024,7 +1075,6 @@
     el.gpsBanner.hidden = true;
   }
 
-  /* --- Foreground-only GPS (iOS suspends the watch while the page is hidden) --- */
   document.addEventListener('visibilitychange', () => {
     if (S.screen !== 'game') return;
     if (document.visibilityState === 'hidden') {
@@ -1375,18 +1425,8 @@
   }
 
   /* ================================================================ */
-  /* Boot                                                             */
+  /* Chat                                                             */
   /* ================================================================ */
-
-  setScreen('home');
-  showOverlay(
-    'Connecting to server…',
-    'This may take up to a minute on first launch while the free server wakes up.'
-  );
-
-  // Kick Render awake immediately (the socket handshake alone can time out
-  // while the service is still spinning up).
-  fetch('/wake', { cache: 'no-store' }).catch(() => {});
 
   function updateChatBadge() {
     const label = S.chatUnread > 0 ? 'Chat ' + S.chatUnread : 'Chat';
@@ -1462,4 +1502,43 @@
       if (res && res.ok === false && res.error) toast(res.error, 'error');
     });
   });
+
+  /* ================================================================ */
+  /* iOS slider touch fix                                             */
+  /* ================================================================ */
+
+  document.addEventListener('touchstart', () => {}, { passive: true });
+
+  if (isIos) {
+    document.querySelectorAll('input[type="range"]').forEach((slider) => {
+      slider.addEventListener(
+        'touchend',
+        (e) => {
+          const rect = slider.getBoundingClientRect();
+          const touch = e.changedTouches[0];
+          const val =
+            (touch.pageX - rect.left) / (rect.right - rect.left) *
+              (Number(slider.max) - Number(slider.min)) +
+            Number(slider.min);
+          const step = Number(slider.step) || 1;
+          const stepped = Math.round(val / step) * step;
+          slider.value = String(Math.min(Number(slider.max), Math.max(Number(slider.min), stepped)));
+          slider.dispatchEvent(new Event('change'));
+        },
+        { passive: true }
+      );
+    });
+  }
+
+  /* ================================================================ */
+  /* Boot                                                             */
+  /* ================================================================ */
+
+  setScreen('home');
+  showOverlay(
+    'Connecting to server…',
+    'This may take up to a minute on first launch while the free server wakes up.'
+  );
+
+  fetch('/wake', { cache: 'no-store' }).catch(() => {});
 })();

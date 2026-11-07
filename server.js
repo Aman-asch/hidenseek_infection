@@ -659,6 +659,14 @@ function broadcastPings(room) {
     for (const other of all) {
       if (!canSee(room, viewer, other)) continue;
 
+      // During the initial gather, do not broadcast a player who has no
+      // real fix yet (or whose fix is very poor). This stops everyone
+      // from appearing on top of each other before GPS has locked on.
+      if (room.stage === 'gather') {
+        const fix = other.lastLocation;
+        if (!fix || !Number.isFinite(fix.accuracy) || fix.accuracy > 50) continue;
+      }
+
       const pos = resolved.get(other.sessionId);
       if (!pos) continue;
 
