@@ -230,7 +230,36 @@ input[type="range"]::-moz-range-thumb {
   pointer-events: none;
   z-index: 500;
 }
-.hud-top-right { display: flex; align-items: center; gap: 8px; pointer-events: auto; }
+.hud-top-right {
+  display: flex; align-items: center; justify-content: flex-end;
+  flex-wrap: wrap; gap: 8px; pointer-events: auto;
+}
+
+.map-style {
+  display: flex;
+  background: rgba(11, 15, 20, .82);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.map-style-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 10px 12px;
+  min-height: 44px;
+  cursor: pointer;
+}
+.map-style-btn.is-on {
+  background: var(--bg-3);
+  color: var(--text);
+}
 
 .timer {
   font-size: 22px; font-weight: 800;
@@ -294,6 +323,12 @@ input[type="range"]::-moz-range-thumb {
 }
 .ping-marker.zombie .dot { background: var(--red); }
 .ping-marker.survivor .dot { background: var(--green); }
+.ping-marker.stale .dot {
+  background: transparent;
+  box-shadow: none;
+}
+.ping-marker.stale.zombie .dot { border-color: var(--red); }
+.ping-marker.stale.survivor .dot { border-color: var(--green); }
 
 .ping-marker .pulse {
   position: absolute; inset: 0;
@@ -420,5 +455,10 @@ input[type="range"]::-moz-range-thumb {
 .popup-acc {
   color: var(--muted);
   font-size: 11px;
+}
+.popup-stale {
+  color: #ffc857;
+  font-size: 11px;
+  margin-top: 4px;
 }
 

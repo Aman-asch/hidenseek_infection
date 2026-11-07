@@ -10,6 +10,7 @@
   const LS_NICK = 'infection.nickname';
   const LS_ROOM = 'infection.roomCode';
   const LS_SETTINGS = 'infection.settings';
+  const LS_MAP_STYLE = 'infection.mapStyle';
 
   const GEO_OPTS = {
     enableHighAccuracy: true, // use the GPS radio, not Wi-Fi/cell
@@ -101,6 +102,9 @@
 
     map: null,
     mapReady: false,
+    mapStyle: 'satellite',
+    baseLayer: null,
+    wakeLock: null,
     selfMarker: null,
     accuracyCircle: null,
     pingMarkers: new Map(), // id -> { marker, lat, lng, ts, nickname, role }
@@ -169,6 +173,8 @@
     btnPlayers: $('btn-players'),
     btnTag: $('btn-tag'),
     btnRecenter: $('btn-recenter'),
+    btnMapPlain: $('btn-map-plain'),
+    btnMapSat: $('btn-map-sat'),
     gpsBanner: $('gps-banner'),
     hiddenBanner: $('hidden-banner'),
 
@@ -219,6 +225,7 @@
 
     if (name === 'game') {
       ensureMap();
+      acquireWakeLock();
       // Leaflet needs a tick after the container becomes visible.
       requestAnimationFrame(() => {
         if (S.map) S.map.invalidateSize();
@@ -227,6 +234,8 @@
         window.__timerLoop = true;
         requestAnimationFrame(timerLoop);
       }
+    } else {
+      releaseWakeLock();
     }
   }
 
@@ -494,6 +503,46 @@
   /* Map                                                              */
   /* ================================================================ */
 
+  const BASEMAPS = {
+    map: {
+      url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
+      attribution:
+        'Tiles &copy; Esri &mdash; Sources: Esri, DeLorme, NAVTEQ, USGS, Intermap, iPC, NRCAN, Esri Japan, METI, Esri China (Hong Kong), Esri Thailand, TomTom',
+    },
+    satellite: {
+      url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+      attribution:
+        'Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community',
+    },
+  };
+
+  function syncMapStyleButtons() {
+    const satellite = S.mapStyle === 'satellite';
+    el.btnMapPlain.classList.toggle('is-on', !satellite);
+    el.btnMapSat.classList.toggle('is-on', satellite);
+    el.btnMapPlain.setAttribute('aria-pressed', satellite ? 'false' : 'true');
+    el.btnMapSat.setAttribute('aria-pressed', satellite ? 'true' : 'false');
+  }
+
+  function applyMapStyle(style) {
+    if (!BASEMAPS[style]) style = 'satellite';
+    S.mapStyle = style;
+    try {
+      localStorage.setItem(LS_MAP_STYLE, style);
+    } catch (_) {
+      /* ignore */
+    }
+    syncMapStyleButtons();
+    if (!S.map) return;
+    if (S.baseLayer) S.map.removeLayer(S.baseLayer);
+    const spec = BASEMAPS[style];
+    S.baseLayer = L.tileLayer(spec.url, {
+      attribution: spec.attribution,
+      maxZoom: 19,
+    }).addTo(S.map);
+    S.baseLayer.bringToBack();
+  }
+
   function ensureMap() {
     if (S.mapReady) return;
     S.mapReady = true;
@@ -504,19 +553,22 @@
       preferCanvas: true,
     }).setView([20, 0], 2);
 
-    L.tileLayer(
-      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-      {
-        attribution:
-          'Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community',
-        maxZoom: 19,
-      }
-    ).addTo(S.map);
+    applyMapStyle(S.mapStyle);
 
     S.map.on('dragstart', () => {
       S.userPanned = true;
     });
   }
+
+  try {
+    const savedMap = localStorage.getItem(LS_MAP_STYLE);
+    if (savedMap === 'map' || savedMap === 'satellite') S.mapStyle = savedMap;
+  } catch (_) {
+    /* ignore */
+  }
+  syncMapStyleButtons();
+  el.btnMapPlain.addEventListener('click', () => applyMapStyle('map'));
+  el.btnMapSat.addEventListener('click', () => applyMapStyle('satellite'));
 
   function updateSelfMarker(lat, lng, accuracy) {
     if (!S.map) return;
@@ -579,6 +631,9 @@
       `<div class="popup-meta popup-acc">Their GPS ${
         theirAcc !== null ? '±' + Math.round(theirAcc) + 'm' : '?'
       }${myAcc !== null ? ' · Yours ±' + Math.round(myAcc) + 'm' : ''}</div>` +
+      (ping.stale
+        ? `<div class="popup-stale">Stale fix — best available. Don't trust this marker if their GPS is poor.</div>`
+        : '') +
       '</div>'
     );
   }
@@ -597,7 +652,7 @@
           pings
             .map(
               (p) =>
-                `${p.nickname}[${p.role}]±${p.accuracy ? Math.round(p.accuracy) + 'm' : '?'}`
+                `${p.nickname}[${p.role}]±${p.accuracy ? Math.round(p.accuracy) + 'm' : '?'}${p.stale ? ' stale' : ''}`
             )
             .join(', ')
       );
@@ -611,7 +666,8 @@
         existing &&
         existing.ts === ping.ts &&
         existing.lat === ping.lat &&
-        existing.lng === ping.lng
+        existing.lng === ping.lng &&
+        existing.stale === !!ping.stale
       ) {
         continue; // unchanged fix — do not restart the pulse
       }
@@ -624,7 +680,7 @@
       const icon = L.divIcon({
         className: 'ping-icon-wrap',
         html:
-          `<div class="ping-marker ${ping.role}">` +
+          `<div class="ping-marker ${ping.role}${ping.stale ? ' stale' : ''}">` +
           '<span class="pulse"></span><span class="dot"></span>' +
           '</div>',
         iconSize: [26, 26],
@@ -655,6 +711,7 @@
         lat: ping.lat,
         lng: ping.lng,
         ts: ping.ts,
+        stale: !!ping.stale,
         nickname: ping.nickname,
         role: ping.role,
       });
@@ -698,7 +755,29 @@
       return;
     }
 
+    // A one-shot high-accuracy request wakes the GPS radio on iOS before the watch starts.
+    navigator.geolocation.getCurrentPosition(() => {}, () => {}, GEO_OPTS);
     S.watchId = navigator.geolocation.watchPosition(onPosition, onGpsError, GEO_OPTS);
+  }
+
+  function acquireWakeLock() {
+    if (!('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+    if (S.wakeLock) return;
+    navigator.wakeLock
+      .request('screen')
+      .then((lock) => {
+        S.wakeLock = lock;
+        lock.addEventListener('release', () => {
+          if (S.wakeLock === lock) S.wakeLock = null;
+        });
+      })
+      .catch(() => {});
+  }
+
+  function releaseWakeLock() {
+    const lock = S.wakeLock;
+    S.wakeLock = null;
+    if (lock) lock.release().catch(() => {});
   }
 
   function stopGps() {
@@ -789,11 +868,22 @@
     el.gpsBanner.hidden = true;
   }
 
-  /* --- Foreground-only warning (iOS PWA cannot do background GPS) --- */
+  /* --- Foreground-only GPS (iOS suspends the watch while the page is hidden) --- */
   document.addEventListener('visibilitychange', () => {
     if (S.screen !== 'game') return;
-    el.hiddenBanner.hidden = document.visibilityState !== 'hidden';
-    if (document.visibilityState === 'visible' && S.gpsOk) hideGpsBanner();
+    if (document.visibilityState === 'hidden') {
+      el.hiddenBanner.hidden = false;
+      return;
+    }
+    el.hiddenBanner.hidden = true;
+    if (S.gpsOk) hideGpsBanner();
+    stopGps();
+    startGps();
+    acquireWakeLock();
+  });
+
+  document.addEventListener('pointerdown', () => {
+    if (S.screen === 'game') acquireWakeLock();
   });
 
   /* ================================================================ */

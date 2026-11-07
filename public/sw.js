@@ -1,5 +1,5 @@
 /* Infection service worker — app-shell caching only. */
-const VERSION = 'infection-v1';
+const VERSION = 'infection-v2';
 const SHELL = [
   '/',
   '/index.html',

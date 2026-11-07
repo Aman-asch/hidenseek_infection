@@ -31,6 +31,28 @@ const PING_DEFAULT = 30;
 const TICK_MS = 500;                     // internal tick (cheap, no I/O)
 const TIME_BROADCAST_MS = 5000;          // spec: broadcast time-remaining every 5s
 
+// Two-tier GPS filter. Movement keeps anything a phone can reasonably produce.
+// Pings prefer a tighter subset so Wi-Fi/IP geolocation (often 50–500 m off on
+// desktop Chrome) is not drawn as if it were a GPS point. If nothing meets the
+// ping bar, the broadcast is the best fix we have and is marked stale.
+const TRACK_MAX_ACCURACY_M = 50;
+const PING_MAX_ACCURACY_M = 25;
+const SMOOTH_WINDOW_MS = 10 * 1000;
+const STALE_MAX_AGE_MS = 60 * 1000;
+const FIX_BUFFER_MAX = 60;
+
+// A tag lands if the smoothed positions are within 15 m, or if the reported
+// uncertainty circles still overlap after each radius is capped. The cap stops
+// a ±150 m desktop fix from authorizing a tag from across campus.
+const TAG_DISTANCE_M = 15;
+const TAG_RADIUS_CAP_M = 30;
+const TAG_ABS_MAX_M = 40;
+
+// A fix that jumps farther than a person can move is kept in the raw buffer
+// but left out of the median. 80 m in a few seconds is a GPS spike, not a sprint.
+const TELEPORT_MIN_M = 80;
+const TELEPORT_MAX_MPS = 12;
+
 /* ------------------------------------------------------------------ */
 /* State (in-memory only, discarded when the room ends)                */
 /* ------------------------------------------------------------------ */
@@ -152,6 +174,142 @@ function haversineM(lat1, lng1, lat2, lng2) {
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
 }
 
+function medianNum(values) {
+  if (!values.length) return null;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2) return sorted[mid];
+  return (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function usableAccuracy(accuracy) {
+  return Number.isFinite(accuracy) && accuracy >= 0;
+}
+
+function isGoodFix(fix) {
+  return usableAccuracy(fix.accuracy) && fix.accuracy <= PING_MAX_ACCURACY_M && !fix.teleport;
+}
+
+function isTrackFix(fix) {
+  return usableAccuracy(fix.accuracy) && fix.accuracy <= TRACK_MAX_ACCURACY_M && !fix.teleport;
+}
+
+/** True when this fix could not have been reached on foot from the last tracked one. */
+function looksLikeTeleport(player, fix) {
+  const prev = player.lastTrackedFix;
+  if (!prev) return false;
+  const dt = (fix.ts - prev.ts) / 1000;
+  if (!(dt > 0 && dt <= 30)) return false;
+  const dist = haversineM(prev.lat, prev.lng, fix.lat, fix.lng);
+  if (dist < TELEPORT_MIN_M) return false;
+  return dist / dt > TELEPORT_MAX_MPS;
+}
+
+/** Drop fixes that have aged out of the smoothing window. */
+function pruneFixes(player, now) {
+  const cutoff = now - SMOOTH_WINDOW_MS;
+  if (player.fixes.length > FIX_BUFFER_MAX) {
+    player.fixes.splice(0, player.fixes.length - FIX_BUFFER_MAX);
+  }
+  let drop = 0;
+  while (drop < player.fixes.length && player.fixes[drop].ts < cutoff) drop++;
+  if (drop > 0) player.fixes.splice(0, drop);
+  return player.fixes;
+}
+
+function positionFromFixes(fixes, stale) {
+  return {
+    lat: medianNum(fixes.map((f) => f.lat)),
+    lng: medianNum(fixes.map((f) => f.lng)),
+    accuracy: medianNum(fixes.map((f) => f.accuracy)),
+    ts: fixes.reduce((max, f) => Math.max(max, f.ts), 0),
+    stale: !!stale,
+    samples: fixes.length,
+  };
+}
+
+function rememberGood(player, pos) {
+  if (!pos || !usableAccuracy(pos.accuracy)) return;
+  if (pos.accuracy > TRACK_MAX_ACCURACY_M) return;
+  player.lastGood = pos;
+}
+
+/**
+ * Median of the last 10s of fixes that are good enough to track (≤ 50 m).
+ * Used for tag distance so one jumped point cannot make or break a tag.
+ */
+function trackingPosition(player, now) {
+  const window = pruneFixes(player, now);
+  const track = window.filter(isTrackFix);
+  if (track.length) {
+    const pos = positionFromFixes(track, false);
+    rememberGood(player, pos);
+    return pos;
+  }
+  const prev = player.lastGood;
+  if (prev && now - prev.ts <= STALE_MAX_AGE_MS) {
+    return { ...prev, stale: true };
+  }
+  return null;
+}
+
+/**
+ * Position broadcast on a ping. Prefers a median of ≤ 25 m fixes. Falls back
+ * to the track-quality median, then to the single tightest raw fix, then to
+ * the last good position if it is less than a minute old. Fallbacks are stale.
+ */
+function pingPosition(player, now) {
+  const window = pruneFixes(player, now);
+  const good = window.filter(isGoodFix);
+  if (good.length) {
+    const pos = positionFromFixes(good, false);
+    rememberGood(player, pos);
+    return pos;
+  }
+
+  const track = window.filter(isTrackFix);
+  if (track.length) {
+    const pos = positionFromFixes(track, true);
+    rememberGood(player, pos);
+    return pos;
+  }
+
+  const ranked = window.filter((f) => usableAccuracy(f.accuracy) && !f.teleport);
+  if (ranked.length) {
+    const best = ranked.reduce((a, b) => (a.accuracy <= b.accuracy ? a : b));
+    return {
+      lat: best.lat,
+      lng: best.lng,
+      accuracy: best.accuracy,
+      ts: best.ts,
+      stale: true,
+      samples: 1,
+    };
+  }
+
+  const prev = player.lastGood;
+  if (prev && now - prev.ts <= STALE_MAX_AGE_MS) {
+    return { ...prev, stale: true };
+  }
+  return null;
+}
+
+/**
+ * True when the players are within 15 m, or when their accuracy circles still
+ * overlap after each radius is capped at 30 m — and the centres are within 40 m.
+ * The 18 m "I'm standing next to them" case passes when both phones are ±10 m.
+ * A ±150 m desktop fix cannot authorize a tag from across campus.
+ */
+function tagProximityOk(distanceM, acc1, acc2) {
+  if (!Number.isFinite(distanceM)) return false;
+  if (distanceM <= TAG_DISTANCE_M) return true;
+  if (distanceM > TAG_ABS_MAX_M) return false;
+  if (!usableAccuracy(acc1) || !usableAccuracy(acc2)) return false;
+  const a = Math.min(acc1, TAG_RADIUS_CAP_M);
+  const b = Math.min(acc2, TAG_RADIUS_CAP_M);
+  return a + b - distanceM > 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Serialization (per-socket — 3-digit codes are NEVER leaked)         */
 /* ------------------------------------------------------------------ */
@@ -220,7 +378,10 @@ function addPlayer(room, sessionId, nickname) {
     nickname,
     code,
     isTagged: false,
-    lastLocation: null,
+    lastLocation: null,          // latest raw fix (unfiltered)
+    fixes: [],                   // raw ring buffer, last ~10 s
+    lastTrackedFix: null,        // last fix admitted into the median
+    lastGood: null,              // last median built from ≤ 50 m fixes
     connected: true,
     socketId: null,
     graceTimer: null,
@@ -343,6 +504,8 @@ function broadcastPings(room) {
   if (!rooms.has(room.code) || room.phase !== 'running') return;
   const all = [...room.players.values()];
   const now = Date.now();
+  const resolved = new Map();
+  for (const p of all) resolved.set(p.sessionId, pingPosition(p, now));
 
   for (const viewer of all) {
     const s = socketFor(viewer);
@@ -351,19 +514,23 @@ function broadcastPings(room) {
     const pings = [];
     for (const other of all) {
       if (other.sessionId === viewer.sessionId) continue;
-      if (!other.lastLocation) continue;
 
       const viewerIsZombie = viewer.isTagged;
       const otherIsZombie = other.isTagged;
       if (viewerIsZombie === otherIsZombie) continue; // same team -> hidden
 
+      const pos = resolved.get(other.sessionId);
+      if (!pos) continue;
+
       pings.push({
         id: other.sessionId,
         nickname: other.nickname,
-        lat: other.lastLocation.lat,   // raw, unrounded, unoffset
-        lng: other.lastLocation.lng,
-        accuracy: other.lastLocation.accuracy,
-        ts: other.lastLocation.ts,
+        lat: pos.lat,
+        lng: pos.lng,
+        accuracy: pos.accuracy,
+        ts: pos.ts,
+        stale: pos.stale,
+        samples: pos.samples,
         role: otherIsZombie ? 'zombie' : 'survivor',
       });
     }
@@ -374,6 +541,7 @@ function broadcastPings(room) {
           (p) =>
             `${p.nickname}[${p.role === 'zombie' ? 'Z' : 'S'}]` +
             `\u00b1${p.accuracy ? Math.round(p.accuracy) + 'm' : '?'}` +
+            `${p.stale ? ' stale' : ''}` +
             `@${p.lat.toFixed(5)},${p.lng.toFixed(5)}`
         )
         .join('  ');
@@ -681,28 +849,36 @@ io.on('connection', (socket) => {
     }
 
     const accuracy = Number(payload.accuracy);
+    const acc = usableAccuracy(accuracy) ? accuracy : null;
+    const now = Date.now();
     const prev = player.lastLocation;
     const movedM = prev ? haversineM(prev.lat, prev.lng, lat, lng) : null;
 
-    // Store raw, untouched coordinates. No rounding, no offsets.
-    player.lastLocation = {
-      lat,
-      lng,
-      accuracy: Number.isFinite(accuracy) ? accuracy : null,
-      ts: Date.now(),
-    };
+    // Raw fix is always kept. Smoothing reads this buffer later; nothing here
+    // is rounded or offset. Fixes worse than 50 m stay in the buffer so a ping
+    // can fall back to them, but they are left out of the median.
+    const fix = { lat, lng, accuracy: acc, ts: now, teleport: false };
+    fix.teleport = looksLikeTeleport(player, fix);
+    player.lastLocation = fix;
+    player.fixes.push(fix);
+    pruneFixes(player, now);
 
-    // Log the first fix, every poor fix, and any significant accuracy change.
-    const accStr = Number.isFinite(accuracy) ? `${Math.round(accuracy)}m` : '?';
-    const prevAcc = prev && Number.isFinite(prev.accuracy) ? prev.accuracy : null;
-    const accChanged =
-      !prev || prevAcc === null || Math.abs(prevAcc - accuracy) > 20;
-    const poor = Number.isFinite(accuracy) && accuracy > 100;
+    const tracked = acc !== null && acc <= TRACK_MAX_ACCURACY_M && !fix.teleport;
+    if (tracked) player.lastTrackedFix = fix;
+    const accStr = acc !== null ? `${Math.round(acc)}m` : '?';
+    const prevAcc = prev && usableAccuracy(prev.accuracy) ? prev.accuracy : null;
+    const accChanged = !prev || prevAcc === null || Math.abs(prevAcc - acc) > 20;
+    const poor = acc === null || acc > TRACK_MAX_ACCURACY_M;
 
     if (!prev || poor || accChanged) {
       const movedStr = movedM !== null ? ` moved=${movedM.toFixed(1)}m` : '';
+      const note = fix.teleport
+        ? '  <-- teleport, not tracked'
+        : !tracked
+          ? '  <-- not tracked (>50m or unknown)'
+          : '';
       log(
-        `[loc] ${player.nickname} lat=${lat.toFixed(6)} lng=${lng.toFixed(6)} acc=${accStr}${movedStr}${poor ? '  <-- POOR' : ''}`
+        `[loc] ${player.nickname} lat=${lat.toFixed(6)} lng=${lng.toFixed(6)} acc=${accStr}${movedStr}${note}`
       );
     }
   });
@@ -732,23 +908,34 @@ io.on('connection', (socket) => {
       return cb({ ok: false, error: 'No living survivor with that code.' });
     }
 
+    const now = Date.now();
+    const taggerPos = trackingPosition(tagger, now);
+    const targetPos = trackingPosition(target, now);
+    if (!taggerPos || !targetPos) {
+      log(`[tag] ${tagger.nickname}: FAILED code=${code} (no track-quality fix)`);
+      return cb({
+        ok: false,
+        error: 'GPS is not accurate enough to confirm you are close. Wait for a fix better than ±50 m.',
+      });
+    }
+
+    const dist = haversineM(taggerPos.lat, taggerPos.lng, targetPos.lat, targetPos.lng);
+    const accStr =
+      `taggerAcc=±${Math.round(taggerPos.accuracy)}m targetAcc=±${Math.round(targetPos.accuracy)}m`;
+    if (!tagProximityOk(dist, taggerPos.accuracy, targetPos.accuracy)) {
+      log(
+        `[tag] ${tagger.nickname}: FAILED ${target.nickname} (${code}) dist=${dist.toFixed(1)}m ${accStr}`
+      );
+      return cb({
+        ok: false,
+        error: `Too far to tag (${Math.round(dist)} m apart). Get within 15 m, or close enough that your GPS circles overlap.`,
+      });
+    }
+
     target.isTagged = true;
 
-    const distStr =
-      tagger.lastLocation && target.lastLocation
-        ? `dist=${haversineM(
-            tagger.lastLocation.lat,
-            tagger.lastLocation.lng,
-            target.lastLocation.lat,
-            target.lastLocation.lng
-          ).toFixed(1)}m`
-        : 'dist=unknown';
-    const accStr =
-      tagger.lastLocation && target.lastLocation
-        ? `taggerAcc=\u00b1${tagger.lastLocation.accuracy ? Math.round(tagger.lastLocation.accuracy) + 'm' : '?'} targetAcc=\u00b1${target.lastLocation.accuracy ? Math.round(target.lastLocation.accuracy) + 'm' : '?'}`
-        : '';
     log(
-      `[tag] ${tagger.nickname} tagged ${target.nickname} (${code}) ${distStr} ${accStr}`
+      `[tag] ${tagger.nickname} tagged ${target.nickname} (${code}) dist=${dist.toFixed(1)}m ${accStr}`
     );
 
     cb({ ok: true, tagged: target.nickname });
