@@ -141,6 +141,17 @@ function socketFor(player) {
   return io.sockets.sockets.get(player.socketId) || null;
 }
 
+function haversineM(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+
 /* ------------------------------------------------------------------ */
 /* Serialization (per-socket — 3-digit codes are NEVER leaked)         */
 /* ------------------------------------------------------------------ */
@@ -355,6 +366,18 @@ function broadcastPings(room) {
         ts: other.lastLocation.ts,
         role: otherIsZombie ? 'zombie' : 'survivor',
       });
+    }
+
+    if (pings.length > 0) {
+      const summary = pings
+        .map(
+          (p) =>
+            `${p.nickname}[${p.role === 'zombie' ? 'Z' : 'S'}]` +
+            `\u00b1${p.accuracy ? Math.round(p.accuracy) + 'm' : '?'}` +
+            `@${p.lat.toFixed(5)},${p.lng.toFixed(5)}`
+        )
+        .join('  ');
+      log(`[ping] -> ${viewer.nickname} (${viewer.isTagged ? 'Z' : 'S'}): ${summary}`);
     }
 
     // volatile: never queue stale pings for a briefly disconnected client
@@ -648,10 +671,18 @@ io.on('connection', (socket) => {
 
     const lat = Number(payload.lat);
     const lng = Number(payload.lng);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
-    if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return;
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      log(`[loc] ${player.nickname}: rejected invalid coords`, payload);
+      return;
+    }
+    if (Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+      log(`[loc] ${player.nickname}: rejected out-of-range coords`, payload);
+      return;
+    }
 
     const accuracy = Number(payload.accuracy);
+    const prev = player.lastLocation;
+    const movedM = prev ? haversineM(prev.lat, prev.lng, lat, lng) : null;
 
     // Store raw, untouched coordinates. No rounding, no offsets.
     player.lastLocation = {
@@ -660,6 +691,20 @@ io.on('connection', (socket) => {
       accuracy: Number.isFinite(accuracy) ? accuracy : null,
       ts: Date.now(),
     };
+
+    // Log the first fix, every poor fix, and any significant accuracy change.
+    const accStr = Number.isFinite(accuracy) ? `${Math.round(accuracy)}m` : '?';
+    const prevAcc = prev && Number.isFinite(prev.accuracy) ? prev.accuracy : null;
+    const accChanged =
+      !prev || prevAcc === null || Math.abs(prevAcc - accuracy) > 20;
+    const poor = Number.isFinite(accuracy) && accuracy > 100;
+
+    if (!prev || poor || accChanged) {
+      const movedStr = movedM !== null ? ` moved=${movedM.toFixed(1)}m` : '';
+      log(
+        `[loc] ${player.nickname} lat=${lat.toFixed(6)} lng=${lng.toFixed(6)} acc=${accStr}${movedStr}${poor ? '  <-- POOR' : ''}`
+      );
+    }
   });
 
   /* ---------------- tag ---------------- */
@@ -682,10 +727,29 @@ io.on('connection', (socket) => {
         break;
       }
     }
-    if (!target) return cb({ ok: false, error: 'No living survivor with that code.' });
+    if (!target) {
+      log(`[tag] ${tagger.nickname}: FAILED code=${code} (no living survivor)`);
+      return cb({ ok: false, error: 'No living survivor with that code.' });
+    }
 
     target.isTagged = true;
-    log(`Room ${room.code}: ${tagger.nickname} tagged ${target.nickname}`);
+
+    const distStr =
+      tagger.lastLocation && target.lastLocation
+        ? `dist=${haversineM(
+            tagger.lastLocation.lat,
+            tagger.lastLocation.lng,
+            target.lastLocation.lat,
+            target.lastLocation.lng
+          ).toFixed(1)}m`
+        : 'dist=unknown';
+    const accStr =
+      tagger.lastLocation && target.lastLocation
+        ? `taggerAcc=\u00b1${tagger.lastLocation.accuracy ? Math.round(tagger.lastLocation.accuracy) + 'm' : '?'} targetAcc=\u00b1${target.lastLocation.accuracy ? Math.round(target.lastLocation.accuracy) + 'm' : '?'}`
+        : '';
+    log(
+      `[tag] ${tagger.nickname} tagged ${target.nickname} (${code}) ${distStr} ${accStr}`
+    );
 
     cb({ ok: true, tagged: target.nickname });
 

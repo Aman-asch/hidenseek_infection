@@ -395,3 +395,30 @@ input[type="range"]::-moz-range-thumb {
 .toast.error { border-left-color: var(--red); }
 .toast.zombie { border-left-color: var(--red); }
 @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+
+/* ---------------- GPS accuracy indicators ---------------- */
+
+.hud-gps {
+  font-size: 11px;
+  margin-top: 4px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .04em;
+  font-weight: 600;
+}
+.hud-gps.good { color: var(--green); }
+.hud-gps.fair { color: #ffc857; }
+.hud-gps.poor { color: var(--red); }
+
+.popup-uncertainty {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  margin-left: 2px;
+}
+.popup-acc {
+  color: var(--muted);
+  font-size: 11px;
+}
+

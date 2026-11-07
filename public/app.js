@@ -165,6 +165,7 @@
     timer: $('timer'),
     roleBadge: $('role-badge'),
     hudCode: $('hud-code'),
+    hudGps: $('hud-gps'),
     btnPlayers: $('btn-players'),
     btnTag: $('btn-tag'),
     btnRecenter: $('btn-recenter'),
@@ -345,6 +346,9 @@
       ? { msLeft: Math.max(0, data.endsAt - data.serverTime), at: performance.now() }
       : { msLeft: null, at: performance.now() };
 
+    S.centeredOnce = false;
+    S.userPanned = false;
+
     clearPingMarkers();
     setScreen('game');
     renderGameHud();
@@ -357,7 +361,9 @@
   });
 
   socket.on('ping_batch', (data) => {
-    S.pendingPings = data.pings || [];
+    const pings = data.pings || [];
+    console.log(`[ping] received ${pings.length} ping(s) from server`);
+    S.pendingPings = pings;
     if (!S.pingRafPending) {
       S.pingRafPending = true;
       requestAnimationFrame(() => {
@@ -551,11 +557,28 @@
     const dist = S.myPos
       ? haversine(S.myPos.lat, S.myPos.lng, ping.lat, ping.lng)
       : null;
+
+    const theirAcc = Number.isFinite(ping.accuracy) ? ping.accuracy : null;
+    const myAcc =
+      S.myPos && Number.isFinite(S.myPos.accuracy) ? S.myPos.accuracy : null;
+
+    const combined =
+      theirAcc !== null && myAcc !== null
+        ? Math.sqrt(theirAcc * theirAcc + myAcc * myAcc)
+        : null;
+
     return (
       '<div class="popup">' +
       `<strong>${escapeHtml(ping.nickname)}</strong>` +
-      `<div class="popup-dist">${dist === null ? 'Distance unknown' : formatDistance(dist)}</div>` +
+      `<div class="popup-dist">${dist === null ? 'Distance unknown' : formatDistance(dist)}` +
+      (combined !== null
+        ? ` <span class="popup-uncertainty">±${Math.round(combined)}m</span>`
+        : '') +
+      '</div>' +
       `<div class="popup-meta">${ping.role === 'zombie' ? 'Zombie' : 'Survivor'} · pinged ${timeAgo(ping.ts)}</div>` +
+      `<div class="popup-meta popup-acc">Their GPS ${
+        theirAcc !== null ? '±' + Math.round(theirAcc) + 'm' : '?'
+      }${myAcc !== null ? ' · Yours ±' + Math.round(myAcc) + 'm' : ''}</div>` +
       '</div>'
     );
   }
@@ -567,6 +590,18 @@
   function applyPings(pings) {
     if (!S.map) return;
     const seen = new Set();
+
+    if (pings.length > 0) {
+      console.log(
+        `[ping] applying ${pings.length}: ` +
+          pings
+            .map(
+              (p) =>
+                `${p.nickname}[${p.role}]±${p.accuracy ? Math.round(p.accuracy) + 'm' : '?'}`
+            )
+            .join(', ')
+      );
+    }
 
     for (const ping of pings) {
       seen.add(ping.id);
@@ -581,7 +616,10 @@
         continue; // unchanged fix — do not restart the pulse
       }
 
-      if (existing) S.map.removeLayer(existing.marker);
+      if (existing) {
+        S.map.removeLayer(existing.marker);
+        if (existing.accCircle) S.map.removeLayer(existing.accCircle);
+      }
 
       const icon = L.divIcon({
         className: 'ping-icon-wrap',
@@ -597,8 +635,23 @@
       const marker = L.marker([ping.lat, ping.lng], { icon, keyboard: false }).addTo(S.map);
       marker.bindPopup(() => popupHtml(ping));
 
+      let accCircle = null;
+      if (Number.isFinite(ping.accuracy) && ping.accuracy > 0) {
+        const color = ping.role === 'zombie' ? '#ff4d5e' : '#3ddc84';
+        accCircle = L.circle([ping.lat, ping.lng], {
+          radius: ping.accuracy,
+          color,
+          weight: 1,
+          dashArray: '4 4',
+          fillColor: color,
+          fillOpacity: 0.05,
+          interactive: false,
+        }).addTo(S.map);
+      }
+
       S.pingMarkers.set(ping.id, {
         marker,
+        accCircle,
         lat: ping.lat,
         lng: ping.lng,
         ts: ping.ts,
@@ -611,6 +664,7 @@
     for (const [id, entry] of S.pingMarkers) {
       if (!seen.has(id)) {
         S.map.removeLayer(entry.marker);
+        if (entry.accCircle) S.map.removeLayer(entry.accCircle);
         S.pingMarkers.delete(id);
       }
     }
@@ -618,7 +672,10 @@
 
   function clearPingMarkers() {
     if (S.map) {
-      for (const entry of S.pingMarkers.values()) S.map.removeLayer(entry.marker);
+      for (const entry of S.pingMarkers.values()) {
+        S.map.removeLayer(entry.marker);
+        if (entry.accCircle) S.map.removeLayer(entry.accCircle);
+      }
     }
     S.pingMarkers.clear();
   }
@@ -664,12 +721,32 @@
     S.gpsOk = true;
     hideGpsBanner();
     updateSelfMarker(lat, lng, accuracy);
+    updateGpsIndicator(accuracy);
+
+    const accStr = Number.isFinite(accuracy) ? `${Math.round(accuracy)}m` : '?';
+    console.log(`[gps] lat=${lat.toFixed(6)} lng=${lng.toFixed(6)} acc=${accStr}`);
+    if (Number.isFinite(accuracy) && accuracy > 100) {
+      console.warn(`[gps] POOR ACCURACY ${accStr} \u2014 pings will be off by roughly this much`);
+    }
 
     const now = performance.now();
     if (now - S.lastLocationSentAt >= LOCATION_SEND_MS) {
       S.lastLocationSentAt = now;
       socket.emit('location_update', { lat, lng, accuracy });
     }
+  }
+
+  function updateGpsIndicator(accuracy) {
+    if (!el.hudGps) return;
+    if (!Number.isFinite(accuracy)) {
+      el.hudGps.textContent = 'GPS ?';
+      el.hudGps.className = 'hud-gps';
+      return;
+    }
+    const a = Math.round(accuracy);
+    el.hudGps.textContent = `GPS \u00b1${a}m`;
+    el.hudGps.className =
+      'hud-gps ' + (a > 100 ? 'poor' : a > 30 ? 'fair' : 'good');
   }
 
   function onGpsError(err) {
