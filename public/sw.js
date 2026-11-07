@@ -1,5 +1,5 @@
 /* Infection service worker — app-shell caching only. */
-const VERSION = 'infection-v2';
+const VERSION = 'infection-v3';
 const SHELL = [
   '/',
   '/index.html',
@@ -10,6 +10,7 @@ const SHELL = [
   '/icons/icon-512.png',
   'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js',
   'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css',
+  'https://unpkg.com/leaflet-rotate@0.2.8/dist/leaflet-rotate.js',
 ];
 
 self.addEventListener('install', (event) => {

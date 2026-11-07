@@ -28,8 +28,18 @@ const PING_MIN = 10;
 const PING_MAX = 120;
 const PING_DEFAULT = 30;
 
+const GATHER_MS = 5 * 1000;              // everyone shares one map and stands in a circle
+const PLAY_RADIUS_M = 1000;              // fixed circle, it does not shrink
+const SEEKER_WAIT_MIN = 0;
+const SEEKER_WAIT_MAX = 180;
+const SEEKER_WAIT_DEFAULT = 30;
+const GATHER_PING_MS = 1000;
+const CHAT_MAX = 200;
+const CHAT_HISTORY = 40;
+const CHAT_GAP_MS = 400;
+
 const TICK_MS = 500;                     // internal tick (cheap, no I/O)
-const TIME_BROADCAST_MS = 5000;          // spec: broadcast time-remaining every 5s
+const TIME_BROADCAST_MS = 1000;
 
 // Two-tier GPS filter. Movement keeps anything a phone can reasonably produce.
 // Pings prefer a tighter subset so Wi-Fi/IP geolocation (often 50–500 m off on
@@ -129,6 +139,40 @@ function normNickname(raw) {
 
 function normSessionId(raw) {
   return String(raw == null ? '' : raw).trim().slice(0, 64);
+}
+
+function normBoundary(raw) {
+  return raw === 'none' ? 'none' : 'circle';
+}
+
+function readSettings(payload, prev) {
+  const previous = prev || {};
+  const noLimit = !!payload.noLimit;
+  return {
+    roundMinutes: noLimit
+      ? null
+      : clampInt(payload.roundMinutes, ROUND_MIN, ROUND_MAX, previous.roundMinutes ?? ROUND_DEFAULT),
+    pingInterval: clampInt(
+      payload.pingInterval,
+      PING_MIN,
+      PING_MAX,
+      previous.pingInterval ?? PING_DEFAULT
+    ),
+    seekerWait: clampInt(
+      payload.seekerWait,
+      SEEKER_WAIT_MIN,
+      SEEKER_WAIT_MAX,
+      previous.seekerWait ?? SEEKER_WAIT_DEFAULT
+    ),
+    boundary: normBoundary(payload.boundary != null ? payload.boundary : previous.boundary),
+  };
+}
+
+function normChat(raw) {
+  return String(raw == null ? '' : raw)
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .trim()
+    .slice(0, CHAT_MAX);
 }
 
 function getRoom(code) {
@@ -340,6 +384,8 @@ function serializeFor(room, sessionId) {
     settings: {
       roundMinutes: room.settings.roundMinutes, // number | null (no limit)
       pingInterval: room.settings.pingInterval,
+      seekerWait: room.settings.seekerWait,
+      boundary: room.settings.boundary,
     },
     startedAt: room.startedAt,
     endsAt: room.endsAt,
@@ -382,6 +428,8 @@ function addPlayer(room, sessionId, nickname) {
     fixes: [],                   // raw ring buffer, last ~10 s
     lastTrackedFix: null,        // last fix admitted into the median
     lastGood: null,              // last median built from ≤ 50 m fixes
+    sticky: null,                // last position ever broadcast; markers do not vanish
+    lastChatAt: 0,
     connected: true,
     socketId: null,
     graceTimer: null,
@@ -455,11 +503,67 @@ function removePlayer(room, sessionId) {
 
 function startPingTimer(room) {
   if (room.pingTimer) clearInterval(room.pingTimer);
-  const intervalMs = room.settings.pingInterval * 1000;
+  const intervalMs = room.stage === 'gather' ? GATHER_PING_MS : room.settings.pingInterval * 1000;
   room.pingTimer = setInterval(() => {
     if (room.phase !== 'running') return;
     broadcastPings(room);
   }, intervalMs);
+}
+
+function beginHunt(room, now) {
+  room.stage = 'hunt';
+  room.endsAt = room.settings.roundMinutes
+    ? now + room.settings.roundMinutes * 60 * 1000
+    : null;
+  startPingTimer(room);
+}
+
+function lockCenter(room) {
+  if (room.center) return;
+  const pts = [];
+  for (const p of room.players.values()) {
+    const pos = p.sticky || p.lastGood || p.lastLocation;
+    if (pos && Number.isFinite(pos.lat) && Number.isFinite(pos.lng)) pts.push(pos);
+  }
+  if (!pts.length) {
+    room.centerPending = true;
+    return;
+  }
+  room.center = {
+    lat: pts.reduce((sum, p) => sum + p.lat, 0) / pts.length,
+    lng: pts.reduce((sum, p) => sum + p.lng, 0) / pts.length,
+  };
+  room.centerPending = false;
+  log(`Room ${room.code} center locked at ${room.center.lat.toFixed(5)},${room.center.lng.toFixed(5)}`);
+}
+
+function advanceStage(room, now) {
+  if (room.phase !== 'running') return;
+  if (room.stage === 'gather' && now >= room.gatherEndsAt) {
+    lockCenter(room);
+    if (room.settings.seekerWait > 0) {
+      room.stage = 'hiding';
+      startPingTimer(room);
+    } else {
+      beginHunt(room, now);
+    }
+    log(`Room ${room.code} stage -> ${room.stage}`);
+    broadcastPings(room);
+    broadcastTimeRemaining(room);
+  }
+  if (room.stage === 'hiding' && now >= room.huntStartsAt) {
+    beginHunt(room, now);
+    log(`Room ${room.code} hunt started`);
+    broadcastPings(room);
+    broadcastTimeRemaining(room);
+  }
+  if (room.centerPending && room.stage !== 'gather') {
+    lockCenter(room);
+    if (room.center) broadcastTimeRemaining(room);
+  }
+  if (room.stage === 'hunt' && room.endsAt && now >= room.endsAt) {
+    endGame(room, 'survivors', 'time');
+  }
 }
 
 function startTicker(room) {
@@ -468,11 +572,8 @@ function startTicker(room) {
   room.tickInterval = setInterval(() => {
     if (room.phase !== 'running') return;
     const now = Date.now();
-
-    if (room.endsAt && now >= room.endsAt) {
-      endGame(room, 'survivors', 'time');
-      return;
-    }
+    advanceStage(room, now);
+    if (room.phase !== 'running') return;
     if (now - room.lastTimeBroadcast >= TIME_BROADCAST_MS) {
       room.lastTimeBroadcast = now;
       broadcastTimeRemaining(room);
@@ -480,32 +581,75 @@ function startTicker(room) {
   }, TICK_MS);
 }
 
-function msRemaining(room) {
-  if (!room.endsAt) return null;
-  return Math.max(0, room.endsAt - Date.now());
+function stagePayload(room) {
+  const now = Date.now();
+  const preHunt = room.stage === 'gather' || room.stage === 'hiding';
+  return {
+    stage: room.stage || null,
+    msLeft: !preHunt && room.endsAt ? Math.max(0, room.endsAt - now) : null,
+    msUntilHunt: preHunt && room.huntStartsAt ? Math.max(0, room.huntStartsAt - now) : null,
+    center: room.center || null,
+    boundary: room.settings.boundary,
+    radiusM: PLAY_RADIUS_M,
+    seekerWait: room.settings.seekerWait,
+    serverTime: now,
+  };
 }
 
 function broadcastTimeRemaining(room) {
   if (!rooms.has(room.code)) return;
-  const payload = { msLeft: msRemaining(room), serverTime: Date.now() };
+  const payload = stagePayload(room);
   for (const p of room.players.values()) {
     const s = socketFor(p);
     if (s) s.emit('time_remaining', payload);
   }
 }
 
+/** Last smoothed fix, or the last one we already showed, so a marker never blinks out. */
+function displayPosition(player, now) {
+  const pos = pingPosition(player, now);
+  if (pos) {
+    player.sticky = pos;
+    return pos;
+  }
+  if (player.sticky) return { ...player.sticky, stale: true };
+  if (player.lastLocation) {
+    return {
+      lat: player.lastLocation.lat,
+      lng: player.lastLocation.lng,
+      accuracy: player.lastLocation.accuracy,
+      ts: player.lastLocation.ts,
+      stale: true,
+      samples: 1,
+    };
+  }
+  return null;
+}
+
+function canSee(room, viewer, other) {
+  if (viewer.sessionId === other.sessionId) return false;
+  if (room.stage === 'gather') return true;
+  const viewerIsZombie = viewer.isTagged;
+  const otherIsZombie = other.isTagged;
+  if (viewerIsZombie === otherIsZombie) return false;
+  // The seeker waits blind. Survivors can still see where the seeker is standing.
+  if (room.stage === 'hiding' && viewerIsZombie && !otherIsZombie) return false;
+  return true;
+}
+
 /**
- * Visibility rules:
- *   Survivor  -> sees all ZOMBIES (tagged players)
- *   Zombie    -> sees all LIVING SURVIVORS (untagged players)
- * Nobody sees their own team, and nobody sees continuous positions.
+ * Visibility:
+ *   gather  -> everyone sees everyone, so the starting circle is shared
+ *   hiding  -> survivors see the seeker; the seeker sees nobody
+ *   hunt    -> opposite teams only
+ * A player who has ever had a fix keeps that marker until they leave or change team.
  */
 function broadcastPings(room) {
   if (!rooms.has(room.code) || room.phase !== 'running') return;
   const all = [...room.players.values()];
   const now = Date.now();
   const resolved = new Map();
-  for (const p of all) resolved.set(p.sessionId, pingPosition(p, now));
+  for (const p of all) resolved.set(p.sessionId, displayPosition(p, now));
 
   for (const viewer of all) {
     const s = socketFor(viewer);
@@ -513,11 +657,7 @@ function broadcastPings(room) {
 
     const pings = [];
     for (const other of all) {
-      if (other.sessionId === viewer.sessionId) continue;
-
-      const viewerIsZombie = viewer.isTagged;
-      const otherIsZombie = other.isTagged;
-      if (viewerIsZombie === otherIsZombie) continue; // same team -> hidden
+      if (!canSee(room, viewer, other)) continue;
 
       const pos = resolved.get(other.sessionId);
       if (!pos) continue;
@@ -531,11 +671,11 @@ function broadcastPings(room) {
         ts: pos.ts,
         stale: pos.stale,
         samples: pos.samples,
-        role: otherIsZombie ? 'zombie' : 'survivor',
+        role: other.isTagged ? 'zombie' : 'survivor',
       });
     }
 
-    if (pings.length > 0) {
+    if (pings.length > 0 && room.stage !== 'gather') {
       const summary = pings
         .map(
           (p) =>
@@ -548,9 +688,13 @@ function broadcastPings(room) {
       log(`[ping] -> ${viewer.nickname} (${viewer.isTagged ? 'Z' : 'S'}): ${summary}`);
     }
 
-    // volatile: never queue stale pings for a briefly disconnected client
-    s.volatile.emit('ping_batch', { pings, serverTime: now });
+    s.emit('ping_batch', { pings, serverTime: now, stage: room.stage });
   }
+}
+
+function sendChatHistory(socket, room) {
+  if (!socket || !room) return;
+  socket.emit('chat_history', { messages: room.chat || [] });
 }
 
 function sendRole(socket, room, player) {
@@ -560,8 +704,9 @@ function sendRole(socket, room, player) {
     endsAt: room.endsAt,
     roundMinutes: room.settings.roundMinutes,
     pingInterval: room.settings.pingInterval,
-    serverTime: Date.now(),
+    ...stagePayload(room),
   });
+  sendChatHistory(socket, room);
 }
 
 function checkWinCondition(room) {
@@ -637,21 +782,23 @@ io.on('connection', (socket) => {
 
       detachFromCurrentRoom(socket, null);
 
-      const noLimit = !!payload.noLimit;
-      const roundMinutes = noLimit
-        ? null
-        : clampInt(payload.roundMinutes, ROUND_MIN, ROUND_MAX, ROUND_DEFAULT);
-      const pingInterval = clampInt(payload.pingInterval, PING_MIN, PING_MAX, PING_DEFAULT);
+      const settings = readSettings(payload, null);
 
       const code = makeRoomCode();
       const room = {
         code,
         hostSessionId: sessionId,
         players: new Map(),
-        settings: { roundMinutes, pingInterval },
+        settings,
         phase: 'lobby',
+        stage: null,
         startedAt: null,
         endsAt: null,
+        gatherEndsAt: null,
+        huntStartsAt: null,
+        center: null,
+        centerPending: false,
+        chat: [],
         codesPool: makeCodePool(),
         pingTimer: null,
         tickInterval: null,
@@ -674,6 +821,7 @@ io.on('connection', (socket) => {
       log(`Room ${code} created by ${nickname}`);
       cb({ ok: true, roomCode: code });
       broadcastRoomState(room);
+      sendChatHistory(socket, room);
     } catch (err) {
       log('create_room error', err);
       cb({ ok: false, error: 'Server error creating the room.' });
@@ -728,6 +876,8 @@ io.on('connection', (socket) => {
         sendRole(socket, room, player);
         broadcastPings(room);
         broadcastTimeRemaining(room);
+      } else {
+        sendChatHistory(socket, room);
       }
     } catch (err) {
       log('join_room error', err);
@@ -764,6 +914,8 @@ io.on('connection', (socket) => {
         sendRole(socket, room, player);
         broadcastPings(room);
         broadcastTimeRemaining(room);
+      } else {
+        sendChatHistory(socket, room);
       }
     } catch (err) {
       log('reconnect_room error', err);
@@ -781,10 +933,7 @@ io.on('connection', (socket) => {
     if (room.phase !== 'lobby') {
       return cb({ ok: false, error: 'Settings are locked once the game starts.' });
     }
-    room.settings.roundMinutes = payload.noLimit
-      ? null
-      : clampInt(payload.roundMinutes, ROUND_MIN, ROUND_MAX, ROUND_DEFAULT);
-    room.settings.pingInterval = clampInt(payload.pingInterval, PING_MIN, PING_MAX, PING_DEFAULT);
+    room.settings = readSettings(payload, room.settings);
     broadcastRoomState(room);
     cb({ ok: true, settings: room.settings });
   });
@@ -803,11 +952,15 @@ io.on('connection', (socket) => {
       return cb({ ok: false, error: 'You need at least 2 players to start.' });
     }
 
+    const now = Date.now();
     room.phase = 'running';
-    room.startedAt = Date.now();
-    room.endsAt = room.settings.roundMinutes
-      ? room.startedAt + room.settings.roundMinutes * 60 * 1000
-      : null;
+    room.stage = 'gather';
+    room.startedAt = now;
+    room.gatherEndsAt = now + GATHER_MS;
+    room.huntStartsAt = room.gatherEndsAt + room.settings.seekerWait * 1000;
+    room.endsAt = null;
+    room.center = null;
+    room.centerPending = false;
 
     for (const p of players) p.isTagged = false;
 
@@ -908,35 +1061,12 @@ io.on('connection', (socket) => {
       return cb({ ok: false, error: 'No living survivor with that code.' });
     }
 
-    const now = Date.now();
-    const taggerPos = trackingPosition(tagger, now);
-    const targetPos = trackingPosition(target, now);
-    if (!taggerPos || !targetPos) {
-      log(`[tag] ${tagger.nickname}: FAILED code=${code} (no track-quality fix)`);
-      return cb({
-        ok: false,
-        error: 'GPS is not accurate enough to confirm you are close. Wait for a fix better than ±50 m.',
-      });
-    }
-
-    const dist = haversineM(taggerPos.lat, taggerPos.lng, targetPos.lat, targetPos.lng);
-    const accStr =
-      `taggerAcc=±${Math.round(taggerPos.accuracy)}m targetAcc=±${Math.round(targetPos.accuracy)}m`;
-    if (!tagProximityOk(dist, taggerPos.accuracy, targetPos.accuracy)) {
-      log(
-        `[tag] ${tagger.nickname}: FAILED ${target.nickname} (${code}) dist=${dist.toFixed(1)}m ${accStr}`
-      );
-      return cb({
-        ok: false,
-        error: `Too far to tag (${Math.round(dist)} m apart). Get within 15 m, or close enough that your GPS circles overlap.`,
-      });
+    if (room.stage !== 'hunt') {
+      return cb({ ok: false, error: 'The seeker is still waiting. Tags open when the hunt starts.' });
     }
 
     target.isTagged = true;
-
-    log(
-      `[tag] ${tagger.nickname} tagged ${target.nickname} (${code}) dist=${dist.toFixed(1)}m ${accStr}`
-    );
+    log(`[tag] ${tagger.nickname} tagged ${target.nickname} (${code})`);
 
     cb({ ok: true, tagged: target.nickname });
 
@@ -956,7 +1086,40 @@ io.on('connection', (socket) => {
     checkWinCondition(room);
   });
 
-  /* ---------------- leave ---------------- */
+  /* ---------------- chat ---------------- */
+  socket.on('chat', (payload = {}, cb = () => {}) => {
+    const room = getRoom(socket.data.roomCode);
+    if (!room || room.phase === 'ended') return cb({ ok: false, error: 'No game to chat in.' });
+    const player = room.players.get(socket.data.sessionId);
+    if (!player) return cb({ ok: false, error: 'You are not in this room.' });
+
+    const text = normChat(payload.text);
+    if (!text) return cb({ ok: false, error: 'Type a message.' });
+
+    const now = Date.now();
+    if (player.lastChatAt && now - player.lastChatAt < CHAT_GAP_MS) {
+      return cb({ ok: false, error: 'Slow down a little.' });
+    }
+    player.lastChatAt = now;
+
+    const msg = {
+      id: now.toString(36) + Math.random().toString(36).slice(2, 6),
+      nickname: player.nickname,
+      role: player.isTagged ? 'zombie' : 'survivor',
+      sessionId: player.sessionId,
+      text,
+      ts: now,
+    };
+    room.chat.push(msg);
+    if (room.chat.length > CHAT_HISTORY) room.chat.splice(0, room.chat.length - CHAT_HISTORY);
+
+    for (const p of room.players.values()) {
+      const s = socketFor(p);
+      if (s) s.emit('chat_message', msg);
+    }
+    cb({ ok: true });
+  });
+
   socket.on('leave_room', () => {
     const code = socket.data.roomCode;
     detachFromCurrentRoom(socket, null);

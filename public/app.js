@@ -95,10 +95,14 @@
     phase: 'lobby',
     isHost: false,
     players: [],
-    settings: { roundMinutes: 15, pingInterval: 30 },
+    settings: { roundMinutes: 15, pingInterval: 30, seekerWait: 30, boundary: 'circle' },
     myCode: null,
     isTagged: false,
     myPos: null,
+    stage: null,
+    center: null,
+    boundary: 'circle',
+    radiusM: 1000,
 
     map: null,
     mapReady: false,
@@ -107,9 +111,11 @@
     wakeLock: null,
     selfMarker: null,
     accuracyCircle: null,
+    playCircle: null,
     pingMarkers: new Map(), // id -> { marker, lat, lng, ts, nickname, role }
     centeredOnce: false,
     userPanned: false,
+    fittedPlay: false,
 
     timerSync: null,
     watchId: null,
@@ -119,6 +125,8 @@
 
     pingRafPending: false,
     pendingPings: null,
+    chatOpen: false,
+    chatUnread: 0,
   };
 
   /* ================================================================ */
@@ -143,6 +151,10 @@
     noLimit: $('no-limit'),
     pingRange: $('ping-range'),
     pingVal: $('ping-val'),
+    waitRange: $('wait-range'),
+    waitVal: $('wait-val'),
+    boundaryNone: $('boundary-none'),
+    boundaryCircle: $('boundary-circle'),
     btnCreate: $('btn-create'),
 
     btnShowJoin: $('btn-show-join'),
@@ -153,6 +165,7 @@
 
     roomCode: $('room-code'),
     btnLeave: $('btn-leave'),
+    btnRoomChat: $('btn-room-chat'),
     myCode: $('my-code'),
     myStatus: $('my-status'),
     hostControls: $('host-controls'),
@@ -161,22 +174,38 @@
     hostNoLimit: $('host-no-limit'),
     hostPingRange: $('host-ping-range'),
     hostPingVal: $('host-ping-val'),
+    hostWaitRange: $('host-wait-range'),
+    hostWaitVal: $('host-wait-val'),
+    hostBoundaryNone: $('host-boundary-none'),
+    hostBoundaryCircle: $('host-boundary-circle'),
     btnStart: $('btn-start'),
     playerList: $('player-list'),
     playerCount: $('player-count'),
 
     map: $('map'),
     timer: $('timer'),
+    phaseLabel: $('phase-label'),
     roleBadge: $('role-badge'),
     hudCode: $('hud-code'),
     hudGps: $('hud-gps'),
     btnPlayers: $('btn-players'),
     btnTag: $('btn-tag'),
+    btnChat: $('btn-chat'),
     btnRecenter: $('btn-recenter'),
+    btnZoomIn: $('btn-zoom-in'),
+    btnZoomOut: $('btn-zoom-out'),
+    btnNorth: $('btn-north'),
+    btnFit: $('btn-fit'),
     btnMapPlain: $('btn-map-plain'),
     btnMapSat: $('btn-map-sat'),
     gpsBanner: $('gps-banner'),
+    boundaryBanner: $('boundary-banner'),
     hiddenBanner: $('hidden-banner'),
+    chatSheet: $('chat-sheet'),
+    chatLog: $('chat-log'),
+    chatForm: $('chat-form'),
+    chatInput: $('chat-input'),
+    btnChatClose: $('btn-chat-close'),
 
     modalTag: $('modal-tag'),
     tagInput: $('tag-input'),
@@ -341,6 +370,7 @@
     S.roomCode = null;
     localStorage.removeItem(LS_ROOM);
     stopGps();
+    resetChat();
     setScreen('home');
   });
 
@@ -351,22 +381,21 @@
   socket.on('game_started', (data) => {
     S.myCode = data.code;
     S.isTagged = data.isTagged;
-    S.timerSync = data.endsAt
-      ? { msLeft: Math.max(0, data.endsAt - data.serverTime), at: performance.now() }
-      : { msLeft: null, at: performance.now() };
-
     S.centeredOnce = false;
     S.userPanned = false;
+    S.fittedPlay = false;
 
     clearPingMarkers();
     setScreen('game');
+    applyStage(data);
     renderGameHud();
     startGps();
-    toast(data.isTagged ? 'You are PATIENT ZERO. Hunt the survivors!' : 'You are a SURVIVOR. Run!', data.isTagged ? 'zombie' : null);
+    toast('Five seconds — stand together in a circle.', data.isTagged ? 'zombie' : null);
   });
 
   socket.on('time_remaining', (data) => {
-    S.timerSync = { msLeft: data.msLeft, at: performance.now() };
+    applyStage(data);
+    renderGameHud();
   });
 
   socket.on('ping_batch', (data) => {
@@ -384,7 +413,7 @@
 
   socket.on('player_tagged', (data) => {
     if (data.youAreZombie) {
-      toast('You have been tagged — you are now a ZOMBIE.', 'zombie');
+      toast('You have been tagged — you are now a seeker.', 'zombie');
     } else {
       toast(`${data.byNickname} tagged ${data.nickname}.`, 'zombie');
     }
@@ -397,10 +426,10 @@
     S.phase = 'ended';
     localStorage.removeItem(LS_ROOM);
 
-    el.overTitle.textContent = data.winner === 'zombies' ? 'ZOMBIES WIN' : 'SURVIVORS WIN';
+    el.overTitle.textContent = data.winner === 'zombies' ? 'SEEKERS WIN' : 'SURVIVORS WIN';
     el.overSub.textContent =
       data.winner === 'zombies'
-        ? 'Every player was infected.'
+        ? 'Every player was tagged.'
         : 'The round timer expired — the survivors made it.';
 
     el.overList.innerHTML = '';
@@ -411,7 +440,7 @@
         const li = document.createElement('li');
         li.innerHTML =
           `<span class="who"><span class="name">${escapeHtml(p.nickname)}</span></span>` +
-          `<span class="state ${p.isTagged ? 'zombie' : 'alive'}">${p.isTagged ? 'Zombie' : 'Survived'}</span>`;
+          `<span class="state ${p.isTagged ? 'zombie' : 'alive'}">${p.isTagged ? 'Seeker' : 'Survived'}</span>`;
         el.overList.appendChild(li);
       });
 
@@ -432,7 +461,7 @@
     el.roomCode.textContent = S.roomCode || '----';
     el.myCode.textContent = S.myCode || '---';
 
-    el.myStatus.textContent = S.isTagged ? 'Zombie' : 'Survivor';
+    el.myStatus.textContent = S.isTagged ? 'Seeker' : 'Survivor';
     el.myStatus.classList.toggle('zombie', !!S.isTagged);
 
     // Host controls
@@ -445,6 +474,12 @@
       el.hostRoundVal.textContent = round === null ? 'No limit' : round + ' min';
       el.hostPingRange.value = String(S.settings.pingInterval);
       el.hostPingVal.textContent = S.settings.pingInterval + ' s';
+      const wait = Number.isFinite(S.settings.seekerWait) ? S.settings.seekerWait : 30;
+      el.hostWaitRange.value = String(wait);
+      el.hostWaitVal.textContent = wait + ' s';
+      const boundary = S.settings.boundary === 'none' ? 'none' : 'circle';
+      el.hostBoundaryNone.classList.toggle('is-on', boundary === 'none');
+      el.hostBoundaryCircle.classList.toggle('is-on', boundary === 'circle');
     }
 
     // Player list (names only — codes are never broadcast)
@@ -458,7 +493,7 @@
       const state = !p.connected
         ? '<span class="state offline">Offline</span>'
         : p.isTagged
-        ? '<span class="state zombie">Zombie</span>'
+        ? '<span class="state zombie">Seeker</span>'
         : '<span class="state alive">Alive</span>';
       li.innerHTML = `<span class="who"><span class="name">${escapeHtml(p.nickname)}</span>${badges}</span>${state}`;
       el.playerList.appendChild(li);
@@ -472,13 +507,30 @@
   function renderGameHud() {
     if (!S.myCode) return;
 
-    el.roleBadge.textContent = S.isTagged ? 'ZOMBIE' : 'SURVIVOR';
+    el.roleBadge.textContent = S.isTagged ? 'SEEKER' : 'SURVIVOR';
     el.roleBadge.classList.toggle('zombie', !!S.isTagged);
 
     el.hudCode.textContent = S.myCode;
     el.hudCode.classList.toggle('greyed', !!S.isTagged);
 
-    el.btnTag.hidden = !S.isTagged;
+    el.btnTag.hidden = !S.isTagged || S.stage !== 'hunt';
+  }
+
+  function applyStage(data) {
+    if (!data) return;
+    if (data.stage) S.stage = data.stage;
+    if (data.boundary) S.boundary = data.boundary;
+    if (Number.isFinite(data.radiusM)) S.radiusM = data.radiusM;
+    if (data.center && Number.isFinite(data.center.lat)) S.center = data.center;
+
+    const preHunt = S.stage === 'gather' || S.stage === 'hiding';
+    S.timerSync = {
+      mode: S.stage || 'hunt',
+      msLeft: preHunt ? data.msUntilHunt : data.msLeft,
+      at: performance.now(),
+    };
+    drawPlayCircle();
+    updateBoundaryWarning();
   }
 
   function timerLoop() {
@@ -487,14 +539,26 @@
       return;
     }
     if (S.timerSync) {
-      if (S.timerSync.msLeft === null) {
+      const left =
+        S.timerSync.msLeft == null
+          ? null
+          : Math.max(0, S.timerSync.msLeft - (performance.now() - S.timerSync.at));
+      if (S.timerSync.mode === 'gather') {
+        el.timer.textContent = formatClock(left || 0);
+        el.phaseLabel.textContent = 'Form a circle';
+      } else if (S.timerSync.mode === 'hiding') {
+        el.timer.textContent = formatClock(left || 0);
+        el.phaseLabel.textContent = S.isTagged ? 'You are waiting' : 'Seeker is waiting';
+      } else if (left == null) {
         el.timer.textContent = 'NO LIMIT';
+        el.phaseLabel.textContent = 'Hunt';
       } else {
-        const left = Math.max(0, S.timerSync.msLeft - (performance.now() - S.timerSync.at));
         el.timer.textContent = formatClock(left);
+        el.phaseLabel.textContent = 'Hunt';
       }
     } else {
       el.timer.textContent = '--:--';
+      el.phaseLabel.textContent = 'Get ready';
     }
     requestAnimationFrame(timerLoop);
   }
@@ -551,11 +615,24 @@
       zoomControl: false,
       attributionControl: true,
       preferCanvas: true,
+      zoomSnap: 0.25,
+      zoomDelta: 1,
+      wheelPxPerZoomLevel: 70,
+      minZoom: 3,
+      maxZoom: 19,
+      rotate: true,
+      bearing: 0,
+      touchRotate: true,
+      shiftKeyRotate: true,
+      touchZoom: true,
+      scrollWheelZoom: true,
+      doubleClickZoom: true,
+      dragging: true,
     }).setView([20, 0], 2);
 
     applyMapStyle(S.mapStyle);
 
-    S.map.on('dragstart', () => {
+    S.map.on('dragstart zoomstart rotatestart', () => {
       S.userPanned = true;
     });
   }
@@ -601,8 +678,58 @@
 
     if (!S.centeredOnce) {
       S.centeredOnce = true;
-      S.map.setView([lat, lng], 18);
+      if (!S.center) S.map.setView([lat, lng], 15);
     }
+    updateBoundaryWarning();
+  }
+
+  function drawPlayCircle() {
+    if (!S.map) return;
+    const show = S.boundary === 'circle' && S.center;
+    if (!show) {
+      if (S.playCircle) {
+        S.map.removeLayer(S.playCircle);
+        S.playCircle = null;
+      }
+      return;
+    }
+    if (!S.playCircle) {
+      S.playCircle = L.circle([S.center.lat, S.center.lng], {
+        radius: S.radiusM,
+        color: '#7fe7ff',
+        weight: 2,
+        dashArray: '6 8',
+        fillColor: '#7fe7ff',
+        fillOpacity: 0.05,
+        interactive: false,
+      }).addTo(S.map);
+    } else {
+      S.playCircle.setLatLng([S.center.lat, S.center.lng]);
+      S.playCircle.setRadius(S.radiusM);
+    }
+    if (!S.fittedPlay) fitPlayArea(false);
+  }
+
+  function fitPlayArea(force) {
+    if (!S.map) return;
+    if (S.playCircle) {
+      S.fittedPlay = true;
+      if (force) S.userPanned = false;
+      S.map.fitBounds(S.playCircle.getBounds(), { padding: [72, 72], maxZoom: 16 });
+      return;
+    }
+    if (force && S.myPos) S.map.setView([S.myPos.lat, S.myPos.lng], 15);
+  }
+
+  function updateBoundaryWarning() {
+    if (!el.boundaryBanner) return;
+    const outside =
+      S.screen === 'game' &&
+      S.boundary === 'circle' &&
+      S.center &&
+      S.myPos &&
+      haversine(S.myPos.lat, S.myPos.lng, S.center.lat, S.center.lng) > S.radiusM;
+    el.boundaryBanner.hidden = !outside;
   }
 
   function popupHtml(ping) {
@@ -627,7 +754,7 @@
         ? ` <span class="popup-uncertainty">±${Math.round(combined)}m</span>`
         : '') +
       '</div>' +
-      `<div class="popup-meta">${ping.role === 'zombie' ? 'Zombie' : 'Survivor'} · pinged ${timeAgo(ping.ts)}</div>` +
+      `<div class="popup-meta">${ping.role === 'zombie' ? 'Seeker' : 'Survivor'} · pinged ${timeAgo(ping.ts)}</div>` +
       `<div class="popup-meta popup-acc">Their GPS ${
         theirAcc !== null ? '±' + Math.round(theirAcc) + 'm' : '?'
       }${myAcc !== null ? ' · Yours ±' + Math.round(myAcc) + 'm' : ''}</div>` +
@@ -661,49 +788,46 @@
     for (const ping of pings) {
       seen.add(ping.id);
       const existing = S.pingMarkers.get(ping.id);
+      const stale = !!ping.stale;
 
       if (
         existing &&
         existing.ts === ping.ts &&
         existing.lat === ping.lat &&
         existing.lng === ping.lng &&
-        existing.stale === !!ping.stale
+        existing.stale === stale &&
+        existing.role === ping.role
       ) {
-        continue; // unchanged fix — do not restart the pulse
+        continue;
       }
 
       if (existing) {
-        S.map.removeLayer(existing.marker);
-        if (existing.accCircle) S.map.removeLayer(existing.accCircle);
+        existing.marker.setLatLng([ping.lat, ping.lng]);
+        if (existing.role !== ping.role || existing.stale !== stale) {
+          existing.marker.setIcon(pingIcon(ping));
+        }
+        if (Number.isFinite(ping.accuracy) && ping.accuracy > 0) {
+          if (!existing.accCircle) {
+            existing.accCircle = accuracyCircleFor(ping);
+          } else {
+            existing.accCircle.setLatLng([ping.lat, ping.lng]);
+            existing.accCircle.setRadius(ping.accuracy);
+          }
+        }
+        existing.marker.bindPopup(() => popupHtml(ping));
+        existing.lat = ping.lat;
+        existing.lng = ping.lng;
+        existing.ts = ping.ts;
+        existing.stale = stale;
+        existing.role = ping.role;
+        existing.nickname = ping.nickname;
+        continue;
       }
 
-      const icon = L.divIcon({
-        className: 'ping-icon-wrap',
-        html:
-          `<div class="ping-marker ${ping.role}${ping.stale ? ' stale' : ''}">` +
-          '<span class="pulse"></span><span class="dot"></span>' +
-          '</div>',
-        iconSize: [26, 26],
-        iconAnchor: [13, 13],
-        popupAnchor: [0, -12],
-      });
-
-      const marker = L.marker([ping.lat, ping.lng], { icon, keyboard: false }).addTo(S.map);
+      const marker = L.marker([ping.lat, ping.lng], { icon: pingIcon(ping), keyboard: false }).addTo(S.map);
       marker.bindPopup(() => popupHtml(ping));
-
-      let accCircle = null;
-      if (Number.isFinite(ping.accuracy) && ping.accuracy > 0) {
-        const color = ping.role === 'zombie' ? '#ff4d5e' : '#3ddc84';
-        accCircle = L.circle([ping.lat, ping.lng], {
-          radius: ping.accuracy,
-          color,
-          weight: 1,
-          dashArray: '4 4',
-          fillColor: color,
-          fillOpacity: 0.05,
-          interactive: false,
-        }).addTo(S.map);
-      }
+      const accCircle =
+        Number.isFinite(ping.accuracy) && ping.accuracy > 0 ? accuracyCircleFor(ping) : null;
 
       S.pingMarkers.set(ping.id, {
         marker,
@@ -711,13 +835,13 @@
         lat: ping.lat,
         lng: ping.lng,
         ts: ping.ts,
-        stale: !!ping.stale,
+        stale,
         nickname: ping.nickname,
         role: ping.role,
       });
     }
 
-    // Players that are no longer visible (tagged, disconnected, out of range)
+    // Drop a marker only when this player is no longer visible (tagged onto your team, or left).
     for (const [id, entry] of S.pingMarkers) {
       if (!seen.has(id)) {
         S.map.removeLayer(entry.marker);
@@ -725,6 +849,32 @@
         S.pingMarkers.delete(id);
       }
     }
+  }
+
+  function pingIcon(ping) {
+    return L.divIcon({
+      className: 'ping-icon-wrap',
+      html:
+        `<div class="ping-marker ${ping.role}${ping.stale ? ' stale' : ''}">` +
+        '<span class="pulse"></span><span class="dot"></span>' +
+        '</div>',
+      iconSize: [26, 26],
+      iconAnchor: [13, 13],
+      popupAnchor: [0, -12],
+    });
+  }
+
+  function accuracyCircleFor(ping) {
+    const color = ping.role === 'zombie' ? '#ff4d5e' : '#3ddc84';
+    return L.circle([ping.lat, ping.lng], {
+      radius: ping.accuracy,
+      color,
+      weight: 1,
+      dashArray: '4 4',
+      fillColor: color,
+      fillOpacity: 0.05,
+      interactive: false,
+    }).addTo(S.map);
   }
 
   function clearPingMarkers() {
@@ -740,9 +890,15 @@
   el.btnRecenter.addEventListener('click', () => {
     if (S.map && S.myPos) {
       S.userPanned = false;
-      S.map.setView([S.myPos.lat, S.myPos.lng], Math.max(S.map.getZoom(), 17));
+      S.map.setView([S.myPos.lat, S.myPos.lng], S.map.getZoom());
     }
   });
+  el.btnZoomIn.addEventListener('click', () => S.map && S.map.zoomIn());
+  el.btnZoomOut.addEventListener('click', () => S.map && S.map.zoomOut());
+  el.btnNorth.addEventListener('click', () => {
+    if (S.map && typeof S.map.setBearing === 'function') S.map.setBearing(0);
+  });
+  el.btnFit.addEventListener('click', () => fitPlayArea(true));
 
   /* ================================================================ */
   /* GPS                                                              */
@@ -902,7 +1058,15 @@
       if (Number.isFinite(savedSettings.pingInterval)) {
         el.pingRange.value = String(savedSettings.pingInterval);
       }
+      if (Number.isFinite(savedSettings.seekerWait)) {
+        el.waitRange.value = String(savedSettings.seekerWait);
+      }
       el.noLimit.checked = !!savedSettings.noLimit;
+      setBoundaryButtons(
+        el.boundaryNone,
+        el.boundaryCircle,
+        savedSettings.boundary === 'none' ? 'none' : 'circle'
+      );
     }
   } catch (_) {
     /* ignore */
@@ -913,12 +1077,24 @@
     el.roundRange.disabled = noLimit;
     el.roundVal.textContent = noLimit ? 'No limit' : el.roundRange.value + ' min';
     el.pingVal.textContent = el.pingRange.value + ' s';
+    el.waitVal.textContent = el.waitRange.value + ' s';
+  }
+  function setBoundaryButtons(noneBtn, circleBtn, boundary) {
+    const circle = boundary !== 'none';
+    noneBtn.classList.toggle('is-on', !circle);
+    circleBtn.classList.toggle('is-on', circle);
+  }
+  function selectedBoundary(noneBtn) {
+    return noneBtn.classList.contains('is-on') ? 'none' : 'circle';
   }
   syncHomeSettingsLabels();
 
   el.roundRange.addEventListener('input', syncHomeSettingsLabels);
   el.noLimit.addEventListener('change', syncHomeSettingsLabels);
   el.pingRange.addEventListener('input', syncHomeSettingsLabels);
+  el.waitRange.addEventListener('input', syncHomeSettingsLabels);
+  el.boundaryNone.addEventListener('click', () => setBoundaryButtons(el.boundaryNone, el.boundaryCircle, 'none'));
+  el.boundaryCircle.addEventListener('click', () => setBoundaryButtons(el.boundaryNone, el.boundaryCircle, 'circle'));
 
   el.btnShowCreate.addEventListener('click', () => {
     el.createPanel.hidden = !el.createPanel.hidden;
@@ -955,6 +1131,8 @@
       nickname,
       roundMinutes: Number(el.roundRange.value),
       pingInterval: Number(el.pingRange.value),
+      seekerWait: Number(el.waitRange.value),
+      boundary: selectedBoundary(el.boundaryNone),
       noLimit: el.noLimit.checked,
     };
     localStorage.setItem(
@@ -962,6 +1140,8 @@
       JSON.stringify({
         roundMinutes: payload.roundMinutes,
         pingInterval: payload.pingInterval,
+        seekerWait: payload.seekerWait,
+        boundary: payload.boundary,
         noLimit: payload.noLimit,
       })
     );
@@ -1022,6 +1202,8 @@
       {
         roundMinutes: Number(el.hostRoundRange.value),
         pingInterval: Number(el.hostPingRange.value),
+        seekerWait: Number(el.hostWaitRange.value),
+        boundary: selectedBoundary(el.hostBoundaryNone),
         noLimit,
       },
       (res) => {
@@ -1045,6 +1227,19 @@
     el.hostPingVal.textContent = el.hostPingRange.value + ' s';
   });
   el.hostPingRange.addEventListener('change', pushHostSettings);
+
+  el.hostWaitRange.addEventListener('input', () => {
+    el.hostWaitVal.textContent = el.hostWaitRange.value + ' s';
+  });
+  el.hostWaitRange.addEventListener('change', pushHostSettings);
+  el.hostBoundaryNone.addEventListener('click', () => {
+    setBoundaryButtons(el.hostBoundaryNone, el.hostBoundaryCircle, 'none');
+    pushHostSettings();
+  });
+  el.hostBoundaryCircle.addEventListener('click', () => {
+    setBoundaryButtons(el.hostBoundaryNone, el.hostBoundaryCircle, 'circle');
+    pushHostSettings();
+  });
 
   el.btnStart.addEventListener('click', () => {
     el.btnStart.disabled = true;
@@ -1129,7 +1324,7 @@
       const state = !p.connected
         ? '<span class="state offline">Offline</span>'
         : p.isTagged
-        ? '<span class="state zombie">Zombie</span>'
+        ? '<span class="state zombie">Seeker</span>'
         : '<span class="state alive">Alive</span>';
       li.innerHTML = `<span class="who"><span class="name">${escapeHtml(p.nickname)}</span>${you}</span>${state}`;
       el.modalPlayerList.appendChild(li);
@@ -1192,4 +1387,79 @@
   // Kick Render awake immediately (the socket handshake alone can time out
   // while the service is still spinning up).
   fetch('/wake', { cache: 'no-store' }).catch(() => {});
+
+  function updateChatBadge() {
+    const label = S.chatUnread > 0 ? 'Chat ' + S.chatUnread : 'Chat';
+    el.btnChat.textContent = label;
+    el.btnRoomChat.textContent = label;
+  }
+
+  function setChatOpen(open) {
+    S.chatOpen = open;
+    el.chatSheet.hidden = !open;
+    if (open) {
+      S.chatUnread = 0;
+      updateChatBadge();
+      el.chatLog.scrollTop = el.chatLog.scrollHeight;
+      setTimeout(() => el.chatInput.focus(), 40);
+    }
+  }
+
+  function appendChat(msg) {
+    const row = document.createElement('div');
+    row.className =
+      'chat-msg' +
+      (msg.sessionId === sessionId ? ' mine' : '') +
+      (msg.role === 'zombie' ? ' zombie' : '');
+    row.innerHTML =
+      `<span class="chat-name">${escapeHtml(msg.nickname)}</span>` +
+      `<span class="chat-text">${escapeHtml(msg.text)}</span>`;
+    el.chatLog.appendChild(row);
+    el.chatLog.scrollTop = el.chatLog.scrollHeight;
+  }
+
+  function renderChatHistory(messages) {
+    el.chatLog.innerHTML = '';
+    if (!messages || !messages.length) {
+      el.chatLog.innerHTML =
+        '<div class="chat-empty">No messages yet. Everyone can read this, including the seeker.</div>';
+      return;
+    }
+    for (const msg of messages) appendChat(msg);
+  }
+
+  function resetChat() {
+    S.chatUnread = 0;
+    updateChatBadge();
+    setChatOpen(false);
+    renderChatHistory([]);
+  }
+
+  socket.on('chat_history', (data) => {
+    renderChatHistory((data && data.messages) || []);
+  });
+
+  socket.on('chat_message', (msg) => {
+    if (!msg) return;
+    const empty = el.chatLog.querySelector('.chat-empty');
+    if (empty) empty.remove();
+    appendChat(msg);
+    if (!S.chatOpen && msg.sessionId !== sessionId) {
+      S.chatUnread += 1;
+      updateChatBadge();
+    }
+  });
+
+  el.btnChat.addEventListener('click', () => setChatOpen(!S.chatOpen));
+  el.btnRoomChat.addEventListener('click', () => setChatOpen(!S.chatOpen));
+  el.btnChatClose.addEventListener('click', () => setChatOpen(false));
+  el.chatForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const text = el.chatInput.value.trim();
+    if (!text) return;
+    el.chatInput.value = '';
+    socket.emit('chat', { text }, (res) => {
+      if (res && res.ok === false && res.error) toast(res.error, 'error');
+    });
+  });
 })();

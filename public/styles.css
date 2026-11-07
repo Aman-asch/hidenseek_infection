@@ -162,6 +162,30 @@ input[type="range"]::-moz-range-thumb {
   margin: 0 0 14px;
   backdrop-filter: blur(8px);
 }
+.seg {
+  display: flex;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+  margin: 6px 0 10px;
+}
+.seg-btn {
+  appearance: none;
+  flex: 1;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 10px 8px;
+  cursor: pointer;
+}
+.seg-btn.is-on { background: var(--bg-3); color: var(--text); }
+.panel .hint, .card .hint { text-align: left; margin: 0 0 12px; }
+
+.btn-tiny { padding: 6px 10px; font-size: 13px; border-radius: 999px; }
 .panel { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
 .panel[hidden] { display: none; }
 
@@ -175,9 +199,11 @@ input[type="range"]::-moz-range-thumb {
 /* ---------------- Room ---------------- */
 
 .room-head {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; justify-content: flex-end;
+  gap: 8px;
   margin: 6px 0 16px;
 }
+.room-head > div:first-child { margin-right: auto; }
 .room-code {
   font-size: 42px; font-weight: 800; letter-spacing: .16em;
   font-variant-numeric: tabular-nums;
@@ -218,8 +244,8 @@ input[type="range"]::-moz-range-thumb {
 
 /* ---------------- Game ---------------- */
 
-.screen-game { padding: 0; overflow: hidden; }
-#map { position: absolute; inset: 0; background: var(--bg-2); }
+.screen-game { padding: 0; overflow: hidden; touch-action: none; }
+#map { position: absolute; inset: 0; background: var(--bg-2); touch-action: none; }
 
 .hud-top {
   position: absolute;
@@ -234,10 +260,55 @@ input[type="range"]::-moz-range-thumb {
   display: flex; align-items: center; justify-content: flex-end;
   flex-wrap: wrap; gap: 8px; pointer-events: auto;
 }
+.timer-wrap { pointer-events: none; display: flex; flex-direction: column; gap: 4px; }
+
+.timer {
+  font-size: 22px; font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  background: rgba(11, 15, 20, .88);
+  border: 1px solid var(--line);
+  padding: 8px 14px; border-radius: 16px;
+  letter-spacing: .04em;
+}
+.phase-label {
+  align-self: flex-start;
+  font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--cyan);
+  background: rgba(11, 15, 20, .88);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 10px;
+}
+
+.map-tools {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 500;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+.tool {
+  pointer-events: auto;
+  width: 44px; height: 44px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(11, 15, 20, .9);
+  color: var(--text);
+  font: inherit;
+  font-size: 20px;
+  font-weight: 700;
+  cursor: pointer;
+  display: grid; place-items: center;
+}
+.tool:active { transform: scale(.96); }
 
 .map-style {
   display: flex;
-  background: rgba(11, 15, 20, .82);
+  background: rgba(11, 15, 20, .88);
   border: 1px solid var(--line);
   border-radius: 999px;
   overflow: hidden;
@@ -261,15 +332,6 @@ input[type="range"]::-moz-range-thumb {
   color: var(--text);
 }
 
-.timer {
-  font-size: 22px; font-weight: 800;
-  font-variant-numeric: tabular-nums;
-  background: rgba(11, 15, 20, .82);
-  border: 1px solid var(--line);
-  padding: 8px 14px; border-radius: 999px;
-  letter-spacing: .04em;
-}
-
 .role-badge {
   font-size: 12px; font-weight: 800; letter-spacing: .12em;
   padding: 9px 14px; border-radius: 999px;
@@ -280,36 +342,83 @@ input[type="range"]::-moz-range-thumb {
 
 .hud-bottom {
   position: absolute;
-  left: 0; right: 0; bottom: 0;
+  left: 10px; right: 10px;
+  bottom: calc(10px + var(--safe-bottom));
   display: flex; align-items: center; justify-content: space-between;
   gap: 12px;
-  padding: 12px 14px calc(12px + var(--safe-bottom));
-  background: linear-gradient(180deg, rgba(11,15,20,0) 0%, rgba(11,15,20,.94) 32%);
+  padding: 10px 12px;
+  background: rgba(11, 15, 20, .92);
+  border: 1px solid var(--line);
+  border-radius: 20px;
   z-index: 500;
+  pointer-events: none;
 }
-.hud-left { min-width: 96px; }
+.hud-left { min-width: 88px; pointer-events: none; }
 .hud-code {
-  font-size: 34px; font-weight: 800; letter-spacing: .18em;
+  font-size: 32px; font-weight: 800; letter-spacing: .14em;
   font-variant-numeric: tabular-nums;
   color: var(--cyan);
   line-height: 1.05;
 }
 .hud-code.greyed { color: var(--muted); text-decoration: line-through; opacity: .55; }
-.hud-actions { display: flex; gap: 10px; }
+.hud-actions { display: flex; gap: 8px; pointer-events: auto; flex-wrap: wrap; justify-content: flex-end; }
+.hud-actions .btn { padding: 12px 14px; }
 
 .banner {
   position: absolute;
-  left: 10px; right: 10px;
-  bottom: calc(96px + var(--safe-bottom));
+  left: 10px; right: 72px;
+  bottom: calc(108px + var(--safe-bottom));
   padding: 12px 14px;
   border-radius: var(--radius);
   font-size: 14px;
   line-height: 1.35;
   z-index: 600;
+  pointer-events: none;
 }
 .banner-warn { background: #4a3406; border: 1px solid #8a6207; color: #ffe6a3; }
 .banner-error { background: #4a0d14; border: 1px solid #8a1722; color: #ffc9ce; }
 .banner[hidden] { display: none; }
+
+.chat-sheet {
+  position: fixed;
+  left: 10px; right: 10px;
+  bottom: calc(96px + var(--safe-bottom));
+  z-index: 700;
+  background: rgba(11, 15, 20, .96);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  display: flex;
+  flex-direction: column;
+  max-height: min(46vh, 380px);
+  pointer-events: auto;
+}
+.chat-sheet[hidden] { display: none; }
+.chat-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px 0;
+}
+.chat-log {
+  overflow-y: auto;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 120px;
+}
+.chat-msg { font-size: 14px; line-height: 1.35; }
+.chat-name {
+  display: block;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  color: var(--cyan);
+}
+.chat-msg.zombie .chat-name { color: var(--red); }
+.chat-msg.mine .chat-name { color: var(--green); }
+.chat-form { display: flex; gap: 8px; padding: 8px; }
+.chat-form .input { padding: 10px 12px; }
+.chat-form .btn { padding: 10px 14px; }
+.chat-empty { color: var(--muted); font-size: 13px; }
 
 /* ---------------- Ping markers ---------------- */
 

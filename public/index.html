@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta
   name="viewport"
-  content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no"
+  content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
 />
 <meta name="theme-color" content="#0b0f14" />
 <meta name="description" content="Real-time multiplayer GPS infection game." />
@@ -73,6 +73,18 @@
       </label>
       <input id="ping-range" type="range" min="10" max="120" step="5" value="30" />
 
+      <label class="label" for="wait-range">
+        Seeker wait <span id="wait-val" class="value">30 s</span>
+      </label>
+      <input id="wait-range" type="range" min="0" max="180" step="5" value="30" />
+
+      <div class="label">Play area</div>
+      <div class="seg" role="group" aria-label="Play area">
+        <button type="button" id="boundary-none" class="seg-btn">No boundary</button>
+        <button type="button" id="boundary-circle" class="seg-btn is-on">1 km circle</button>
+      </div>
+      <p class="hint muted small">5 seconds together to stand in a circle. The circle does not shrink. Then the seeker waits.</p>
+
       <button id="btn-create" class="btn btn-primary btn-block">Create Room</button>
     </div>
   </div>
@@ -111,6 +123,7 @@
       <div id="room-code" class="room-code">----</div>
     </div>
     <button id="btn-leave" class="btn btn-ghost">Leave</button>
+    <button id="btn-room-chat" class="btn btn-ghost">Chat</button>
   </header>
 
   <div class="card">
@@ -140,6 +153,17 @@
     </label>
     <input id="host-ping-range" type="range" min="10" max="120" step="5" value="30" />
 
+    <label class="label" for="host-wait-range">
+      Seeker wait <span id="host-wait-val" class="value">30 s</span>
+    </label>
+    <input id="host-wait-range" type="range" min="0" max="180" step="5" value="30" />
+
+    <div class="label">Play area</div>
+    <div class="seg" role="group" aria-label="Play area">
+      <button type="button" id="host-boundary-none" class="seg-btn">No boundary</button>
+      <button type="button" id="host-boundary-circle" class="seg-btn is-on">1 km circle</button>
+    </div>
+
     <button id="btn-start" class="btn btn-primary btn-block">Start Game</button>
   </div>
 
@@ -149,7 +173,8 @@
   </div>
 
   <p class="hint muted small">
-    Show your 3-digit code only when a zombie is next to you — that is how they tag you.
+    At the start everyone shares the map for 5 seconds and stands in a circle.
+    Show your code only when a seeker is close enough to read it.
   </p>
 </section>
 
@@ -158,19 +183,33 @@
   <div id="map"></div>
 
   <div id="hud-top" class="hud-top">
-    <div id="timer" class="timer">--:--</div>
+    <div class="timer-wrap">
+      <div id="timer" class="timer">--:--</div>
+      <div id="phase-label" class="phase-label">Get ready</div>
+    </div>
     <div class="hud-top-right">
       <div class="map-style" role="group" aria-label="Map style">
         <button type="button" id="btn-map-plain" class="map-style-btn" aria-pressed="false">Map</button>
         <button type="button" id="btn-map-sat" class="map-style-btn is-on" aria-pressed="true">Sat</button>
       </div>
       <div id="role-badge" class="role-badge">SURVIVOR</div>
-      <button id="btn-recenter" class="btn btn-round" title="Centre on me" aria-label="Centre on me">◎</button>
     </div>
+  </div>
+
+  <div class="map-tools" aria-label="Map controls">
+    <button type="button" id="btn-zoom-in" class="tool" aria-label="Zoom in">+</button>
+    <button type="button" id="btn-zoom-out" class="tool" aria-label="Zoom out">−</button>
+    <button type="button" id="btn-north" class="tool" aria-label="Reset rotation" title="North">N</button>
+    <button type="button" id="btn-fit" class="tool" aria-label="Show the play area" title="Play area">◎</button>
+    <button id="btn-recenter" class="tool" title="Centre on me" aria-label="Centre on me">●</button>
   </div>
 
   <div id="gps-banner" class="banner banner-warn" hidden>
     Location unavailable. Check that GPS is enabled and you have a clear view of the sky.
+  </div>
+
+  <div id="boundary-banner" class="banner banner-warn" hidden>
+    You are outside the 1 km play area.
   </div>
 
   <div id="hidden-banner" class="banner banner-error" hidden>
@@ -184,17 +223,30 @@
       <div id="hud-gps" class="hud-gps">GPS: searching…</div>
     </div>
     <div class="hud-actions">
+      <button id="btn-chat" class="btn">Chat</button>
       <button id="btn-players" class="btn">Players</button>
-      <button id="btn-tag" class="btn btn-danger" hidden>Tag Player</button>
+      <button id="btn-tag" class="btn btn-danger" hidden>Tag</button>
     </div>
   </div>
 </section>
+
+<div id="chat-sheet" class="chat-sheet" hidden>
+  <div class="chat-head">
+    <strong>Chat</strong>
+    <button type="button" id="btn-chat-close" class="btn btn-ghost btn-tiny">Close</button>
+  </div>
+  <div id="chat-log" class="chat-log"></div>
+  <form id="chat-form" class="chat-form">
+    <input id="chat-input" class="input" type="text" maxlength="200" placeholder="Message everyone" autocomplete="off" enterkeyhint="send" />
+    <button type="submit" class="btn btn-primary">Send</button>
+  </form>
+</div>
 
 <!-- ======================= MODALS ======================= -->
 <div id="modal-tag" class="modal" hidden>
   <div class="modal-card">
     <h2>Tag a Survivor</h2>
-    <p class="muted">Type the 3-digit code shown on their phone.</p>
+    <p class="muted">Type the 3-digit code on their phone. If you can read it, you are close enough.</p>
     <input
       id="tag-input"
       class="input input-code"
@@ -237,6 +289,7 @@
 <div id="toasts" class="toasts" aria-live="polite"></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-rotate@0.2.8/dist/leaflet-rotate.js"></script>
 <script src="/socket.io/socket.io.js"></script>
 <script src="/app.js"></script>
 </body>
